@@ -7,6 +7,8 @@ import {
   Alert,
   TouchableOpacity
 } from "react-native";
+import * as turf from "@turf/turf"
+import sacJson from "./geojson/sac.json" 
 
 const styles = StyleSheet.create({
   container: {
@@ -19,15 +21,28 @@ const styles = StyleSheet.create({
 
 export default class App extends Component {
   state = {
-    location: null
+    location: null,
+    longitude: 0,
+    latitude: 0
   };
+
+  coordUpdate = () => {
+    var sac = turf.featureCollection(sacJson.features);
+    var location = turf.point([this.state.longitude, this.state.latitude]); 
+
+    console.log(turf.booleanContains(turf.envelope(sac), location));
+  }
 
   findCoordinates = () => {
     navigator.geolocation.getCurrentPosition(
       position => {
         const location = JSON.stringify(position);
-
-        this.setState({ location });
+        this.setState({ 
+            location: location,
+            longitude: position.coords.longitude,
+            latitude: position.coords.latitude 
+        });
+        this.coordUpdate();
       },
       error => Alert.alert(error.message),
       { enableHighAccuracy: true, timeout: 20000, maximumAge: 1000 }
