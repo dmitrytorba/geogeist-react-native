@@ -36,11 +36,12 @@ export default class App extends Component {
   findCoordinates = () => {
     navigator.geolocation.getCurrentPosition(
       position => {
-        const location = JSON.stringify(position);
+        const longitude = position.coords.longitude;
+        const latitude = position.coords.latitude;
         this.setState({ 
-            location: location,
-            longitude: position.coords.longitude,
-            latitude: position.coords.latitude 
+            location: `${longitude}, ${latitude}`,
+            longitude,
+            latitude 
         });
         this.coordUpdate();
       },
