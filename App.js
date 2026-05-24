@@ -16,8 +16,11 @@ import {
 import * as Location from 'expo-location';
 import MapView, { Marker } from 'react-native-maps';
 import Markdown from 'react-native-markdown-display';
+import { WebView } from 'react-native-webview';
 
 const API_BASE = (process.env.EXPO_PUBLIC_API_BASE || 'https://tourapi.torb.uk').replace(/\/$/, '');
+const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
+
 const DEFAULT_REGION = {
   latitude: 37.6191,
   longitude: -122.3816,
@@ -49,8 +52,102 @@ function AIBadge() {
   );
 }
 
+function buildCesiumHtml(apiKey, center) {
+  const startLat = Number(center?.latitude) || DEFAULT_REGION.latitude;
+  const startLng = Number(center?.longitude) || DEFAULT_REGION.longitude;
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.127/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+    <style>
+      html, body, #cesiumContainer { margin: 0; width: 100%; height: 100%; background: #020617; overflow: hidden; }
+      .cesium-viewer-bottom, .cesium-credit-textContainer { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <div id="cesiumContainer"></div>
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.127/Build/Cesium/Cesium.js"></script>
+    <script>
+      (async function () {
+        try {
+          const viewer = new Cesium.Viewer('cesiumContainer', {
+            animation: false,
+            timeline: false,
+            sceneModePicker: false,
+            navigationHelpButton: false,
+            baseLayerPicker: false,
+            geocoder: false,
+            homeButton: false,
+            fullscreenButton: false,
+            infoBox: false,
+            selectionIndicator: false,
+            shouldAnimate: true,
+            globe: false,
+          });
+
+          const tileset = await Cesium.createGooglePhotorealistic3DTileset({ key: '${apiKey}' });
+          viewer.scene.primitives.add(tileset);
+
+          function addMarker(lat, lng, label) {
+            viewer.entities.add({
+              position: Cesium.Cartesian3.fromDegrees(lng, lat, 40),
+              point: {
+                pixelSize: 10,
+                color: Cesium.Color.fromCssColorString('#22d3ee'),
+                outlineColor: Cesium.Color.fromCssColorString('#082f49'),
+                outlineWidth: 2,
+              },
+              label: {
+                text: label || 'Point of interest',
+                fillColor: Cesium.Color.WHITE,
+                showBackground: true,
+                backgroundColor: Cesium.Color.fromCssColorString('rgba(15,23,42,0.75)'),
+                font: '14px sans-serif',
+                pixelOffset: new Cesium.Cartesian2(0, -18),
+              },
+            });
+          }
+
+          function flyTo(lat, lng) {
+            viewer.camera.flyTo({
+              destination: Cesium.Cartesian3.fromDegrees(lng, lat, 2200),
+              orientation: {
+                heading: 0,
+                pitch: Cesium.Math.toRadians(-55),
+                roll: 0,
+              },
+              duration: 1.3,
+            });
+          }
+
+          flyTo(${startLat}, ${startLng});
+
+          window.addEventListener('message', (event) => {
+            try {
+              const msg = JSON.parse(event.data || '{}');
+              if ((msg?.type === 'move_map' || msg?.type === 'you_are_here') && Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
+                addMarker(msg.lat, msg.lng, msg.label);
+                flyTo(msg.lat, msg.lng);
+              }
+            } catch {}
+          });
+
+          window.ReactNativeWebView?.postMessage(JSON.stringify({ type: 'ready' }));
+        } catch (error) {
+          window.ReactNativeWebView?.postMessage(JSON.stringify({ type: 'error', message: String(error?.message || error) }));
+        }
+      })();
+    </script>
+  </body>
+</html>`;
+}
+
 export default function App() {
   const mapRef = useRef(null);
+  const webViewRef = useRef(null);
   const scrollRef = useRef(null);
   const xhrRef = useRef(null);
 
@@ -68,24 +165,34 @@ export default function App() {
   const [blinkOn, setBlinkOn] = useState(true);
   const [error, setError] = useState(null);
   const [hasBootstrapped, setHasBootstrapped] = useState(false);
+  const [use3DMap, setUse3DMap] = useState(Boolean(GOOGLE_MAPS_TILE_API_KEY));
+  const [map3DError, setMap3DError] = useState(null);
 
   const currentLocation = useMemo(() => {
     if (!region?.latitude || !region?.longitude) return null;
     return `${region.latitude},${region.longitude}`;
   }, [region]);
 
-  const flyTo = useCallback((lat, lng) => {
-    const bottomOverlayRatio = isDesktopLayout ? 0 : 0.45;
-    const latitudeOffset = 0.08 * (bottomOverlayRatio * 0.6);
-    const next = {
-      latitude: lat - latitudeOffset,
-      longitude: lng,
-      latitudeDelta: 0.08,
-      longitudeDelta: 0.08,
-    };
-    setRegion(next);
-    mapRef.current?.animateToRegion(next, 1400);
-  }, [isDesktopLayout]);
+  const postWebViewMapEvent = useCallback((type, lat, lng, label) => {
+    webViewRef.current?.postMessage(JSON.stringify({ type, lat, lng, label }));
+  }, []);
+
+  const flyTo = useCallback(
+    (lat, lng, label = 'Point of interest') => {
+      const bottomOverlayRatio = isDesktopLayout ? 0 : 0.45;
+      const latitudeOffset = 0.08 * (bottomOverlayRatio * 0.6);
+      const next = {
+        latitude: lat - latitudeOffset,
+        longitude: lng,
+        latitudeDelta: 0.08,
+        longitudeDelta: 0.08,
+      };
+      setRegion(next);
+      mapRef.current?.animateToRegion(next, 1400);
+      if (use3DMap) postWebViewMapEvent('move_map', lat, lng, label);
+    },
+    [isDesktopLayout, postWebViewMapEvent, use3DMap]
+  );
 
   const addMarker = useCallback((lat, lng, label) => {
     setMarkers((prev) => [
@@ -115,14 +222,15 @@ export default function App() {
       const data = await res.json();
       if (data?.lat && data?.lng) {
         addMarker(data.lat, data.lng, 'You are here');
-        flyTo(data.lat, data.lng);
+        postWebViewMapEvent('you_are_here', data.lat, data.lng, 'You are here');
+        flyTo(data.lat, data.lng, 'You are here');
       }
     } catch {
       setError('Could not determine location.');
     } finally {
       setLoading(false);
     }
-  }, [addMarker, flyTo]);
+  }, [addMarker, flyTo, postWebViewMapEvent]);
 
   const sendPrompt = useCallback(
     (textOverride = null) => {
@@ -169,7 +277,8 @@ export default function App() {
           const payload = parseMoveMapPayload(data);
           if (payload) {
             addMarker(payload.lat, payload.lng, payload.label);
-            flyTo(payload.lat, payload.lng);
+            postWebViewMapEvent('move_map', payload.lat, payload.lng, payload.label);
+            flyTo(payload.lat, payload.lng, payload.label);
           }
         }
 
@@ -230,7 +339,7 @@ export default function App() {
         setInputHeight(40);
       }
     },
-    [addMarker, cleanupStream, currentLocation, flyTo, hasBootstrapped, input, messages]
+    [addMarker, cleanupStream, currentLocation, flyTo, hasBootstrapped, input, messages, postWebViewMapEvent]
   );
 
   useEffect(() => {
@@ -256,7 +365,8 @@ export default function App() {
 
         const { latitude, longitude } = current.coords;
         addMarker(latitude, longitude, 'You are here');
-        flyTo(latitude, longitude);
+        postWebViewMapEvent('you_are_here', latitude, longitude, 'You are here');
+        flyTo(latitude, longitude, 'You are here');
         setLoading(false);
       } catch {
         if (active) await fallbackToIpCoords();
@@ -267,7 +377,7 @@ export default function App() {
       active = false;
       cleanupStream();
     };
-  }, [addMarker, cleanupStream, fallbackToIpCoords, flyTo]);
+  }, [addMarker, cleanupStream, fallbackToIpCoords, flyTo, postWebViewMapEvent]);
 
   useEffect(() => {
     if (!loading && currentLocation && !hasBootstrapped) {
@@ -287,22 +397,43 @@ export default function App() {
     <SafeAreaView style={styles.root}>
       <StatusBar style="light" />
       <View style={styles.container}>
-        <MapView
-          ref={mapRef}
-          style={styles.map}
-          mapType="hybrid"
-          initialRegion={DEFAULT_REGION}
-          region={region}
-          mapPadding={{ top: 0, right: 0, bottom: isDesktopLayout ? 0 : Math.round(height * 0.45), left: 0 }}
-        >
-          {markers.map((marker) => (
-            <Marker
-              key={marker.id}
-              coordinate={{ latitude: marker.latitude, longitude: marker.longitude }}
-              title={marker.label}
-            />
-          ))}
-        </MapView>
+        {use3DMap ? (
+          <WebView
+            ref={webViewRef}
+            style={styles.map}
+            originWhitelist={['*']}
+            source={{ html: buildCesiumHtml(GOOGLE_MAPS_TILE_API_KEY, region) }}
+            javaScriptEnabled
+            domStorageEnabled
+            allowsInlineMediaPlayback
+            onMessage={(event) => {
+              try {
+                const payload = JSON.parse(event.nativeEvent.data || '{}');
+                if (payload?.type === 'error') {
+                  setMap3DError(payload.message || '3D map failed to load.');
+                  setUse3DMap(false);
+                }
+              } catch {}
+            }}
+          />
+        ) : (
+          <MapView
+            ref={mapRef}
+            style={styles.map}
+            mapType="hybrid"
+            initialRegion={DEFAULT_REGION}
+            region={region}
+            mapPadding={{ top: 0, right: 0, bottom: isDesktopLayout ? 0 : Math.round(height * 0.45), left: 0 }}
+          >
+            {markers.map((marker) => (
+              <Marker
+                key={marker.id}
+                coordinate={{ latitude: marker.latitude, longitude: marker.longitude }}
+                title={marker.label}
+              />
+            ))}
+          </MapView>
+        )}
 
         <KeyboardAvoidingView
           style={[styles.chatWrap, panelPositionStyle]}
@@ -315,6 +446,11 @@ export default function App() {
                   <View style={styles.errorBox}>
                     <Text style={styles.errorTitle}>Chat connection failed</Text>
                     <Text style={styles.errorBody}>{error}</Text>
+                  </View>
+                ) : map3DError ? (
+                  <View style={styles.errorBox}>
+                    <Text style={styles.errorTitle}>3D map disabled</Text>
+                    <Text style={styles.errorBody}>{map3DError}</Text>
                   </View>
                 ) : (
                   <ActivityIndicator size="large" color="#fff" />
