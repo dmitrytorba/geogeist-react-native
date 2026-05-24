@@ -10,6 +10,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import * as Location from 'expo-location';
@@ -24,14 +25,12 @@ const DEFAULT_REGION = {
   longitudeDelta: 8,
 };
 
-const ROLE = {
-  human: 'human',
-  ai: 'ai',
-};
+const ROLE = { human: 'human', ai: 'ai' };
+const BLINK_MS = 420;
 
 function parseMoveMapPayload(raw) {
   try {
-    const normalized = raw.replace(/'/g, '"');
+    const normalized = String(raw || '').replace(/'/g, '"');
     const data = JSON.parse(normalized);
     const lat = Number.parseFloat(data.lat);
     const lng = Number.parseFloat(data.lng);
@@ -42,20 +41,33 @@ function parseMoveMapPayload(raw) {
   }
 }
 
+function AIBadge() {
+  return (
+    <View style={styles.aiBadgeOuter}>
+      <Text style={styles.aiBadgeIcon}>📍</Text>
+    </View>
+  );
+}
+
 export default function App() {
   const mapRef = useRef(null);
   const scrollRef = useRef(null);
   const xhrRef = useRef(null);
 
+  const { width, height } = useWindowDimensions();
+  const isDesktopLayout = width >= 768;
+
   const [region, setRegion] = useState(DEFAULT_REGION);
   const [markers, setMarkers] = useState([]);
-  const [hasIntro, setHasIntro] = useState(false);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
+  const [inputHeight, setInputHeight] = useState(40);
   const [loading, setLoading] = useState(true);
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState('');
+  const [blinkOn, setBlinkOn] = useState(true);
   const [error, setError] = useState(null);
+  const [hasBootstrapped, setHasBootstrapped] = useState(false);
 
   const currentLocation = useMemo(() => {
     if (!region?.latitude || !region?.longitude) return null;
@@ -63,15 +75,17 @@ export default function App() {
   }, [region]);
 
   const flyTo = useCallback((lat, lng) => {
+    const bottomOverlayRatio = isDesktopLayout ? 0 : 0.45;
+    const latitudeOffset = 0.08 * (bottomOverlayRatio * 0.6);
     const next = {
-      latitude: lat,
+      latitude: lat - latitudeOffset,
       longitude: lng,
       latitudeDelta: 0.08,
       longitudeDelta: 0.08,
     };
     setRegion(next);
     mapRef.current?.animateToRegion(next, 1400);
-  }, []);
+  }, [isDesktopLayout]);
 
   const addMarker = useCallback((lat, lng, label) => {
     setMarkers((prev) => [
@@ -115,14 +129,15 @@ export default function App() {
       if (!currentLocation) return;
 
       const content = textOverride ?? input;
-      if (hasIntro && !content.trim()) return;
+      const isBootstrap = !hasBootstrapped && (textOverride === '__bootstrap__' || !content.trim());
+      if (!isBootstrap && !content.trim()) return;
 
       setError(null);
       setLoading(true);
       setStreaming(false);
       setStreamText('');
 
-      if (content.trim()) {
+      if (!isBootstrap && content.trim()) {
         setMessages((prev) => [...prev, { role: ROLE.human, content }]);
       }
 
@@ -202,17 +217,26 @@ export default function App() {
       xhr.setRequestHeader('Accept', 'text/event-stream');
       xhr.send(
         JSON.stringify({
-          content: hasIntro ? content : 'hi',
+          content: isBootstrap ? 'hi' : content,
           user_location: currentLocation,
           history: messages,
         })
       );
 
-      setInput('');
-      if (!hasIntro) setHasIntro(true);
+      if (isBootstrap) setHasBootstrapped(true);
+
+      if (!isBootstrap) {
+        setInput('');
+        setInputHeight(40);
+      }
     },
-    [addMarker, cleanupStream, currentLocation, flyTo, hasIntro, input, messages]
+    [addMarker, cleanupStream, currentLocation, flyTo, hasBootstrapped, input, messages]
   );
+
+  useEffect(() => {
+    const t = setInterval(() => setBlinkOn((v) => !v), BLINK_MS);
+    return () => clearInterval(t);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -227,9 +251,7 @@ export default function App() {
           return;
         }
 
-        const current = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced,
-        });
+        const current = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
         if (!active) return;
 
         const { latitude, longitude } = current.coords;
@@ -237,9 +259,7 @@ export default function App() {
         flyTo(latitude, longitude);
         setLoading(false);
       } catch {
-        if (active) {
-          await fallbackToIpCoords();
-        }
+        if (active) await fallbackToIpCoords();
       }
     })();
 
@@ -250,14 +270,18 @@ export default function App() {
   }, [addMarker, cleanupStream, fallbackToIpCoords, flyTo]);
 
   useEffect(() => {
-    if (!loading && !hasIntro && currentLocation) {
-      sendPrompt('hi');
+    if (!loading && currentLocation && !hasBootstrapped) {
+      sendPrompt('__bootstrap__');
     }
-  }, [currentLocation, hasIntro, loading, sendPrompt]);
+  }, [currentLocation, hasBootstrapped, loading, sendPrompt]);
 
   useEffect(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
   }, [messages, streamText, loading]);
+
+  const panelPositionStyle = isDesktopLayout
+    ? { left: 0, bottom: 0, top: 0, width: '34%', padding: 16 }
+    : { left: 0, right: 0, bottom: 0, height: '50%', paddingHorizontal: 8, paddingBottom: 10 };
 
   return (
     <SafeAreaView style={styles.root}>
@@ -269,6 +293,7 @@ export default function App() {
           mapType="hybrid"
           initialRegion={DEFAULT_REGION}
           region={region}
+          mapPadding={{ top: 0, right: 0, bottom: isDesktopLayout ? 0 : Math.round(height * 0.45), left: 0 }}
         >
           {markers.map((marker) => (
             <Marker
@@ -280,55 +305,90 @@ export default function App() {
         </MapView>
 
         <KeyboardAvoidingView
-          style={styles.chatWrap}
+          style={[styles.chatWrap, panelPositionStyle]}
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         >
           <View style={styles.chatPanel}>
-            <ScrollView ref={scrollRef} style={styles.messages} contentContainerStyle={styles.messagesContent}>
-              {error ? <Text style={styles.error}>{error}</Text> : null}
-
-              {messages.map((m, idx) => (
-                <View key={`${m.role}-${idx}`} style={[styles.bubbleRow, m.role === ROLE.human ? styles.userRow : styles.aiRow]}>
-                  <View style={[styles.bubble, m.role === ROLE.human ? styles.userBubble : styles.aiBubble]}>
-                    <Markdown style={markdownStyles}>{m.content}</Markdown>
+            {!messages.length && !streaming ? (
+              <View style={styles.centerState}>
+                {error ? (
+                  <View style={styles.errorBox}>
+                    <Text style={styles.errorTitle}>Chat connection failed</Text>
+                    <Text style={styles.errorBody}>{error}</Text>
                   </View>
-                </View>
-              ))}
+                ) : (
+                  <ActivityIndicator size="large" color="#fff" />
+                )}
+              </View>
+            ) : (
+              <>
+                <ScrollView ref={scrollRef} style={styles.messages} contentContainerStyle={styles.messagesContent}>
+                  {messages.map((m, idx) => (
+                    <View
+                      key={`${m.role}-${idx}`}
+                      style={[styles.bubbleRow, m.role === ROLE.human ? styles.userRow : styles.aiRow]}
+                    >
+                      {m.role === ROLE.ai ? <AIBadge /> : null}
+                      <View style={[styles.bubble, m.role === ROLE.human ? styles.userBubble : styles.aiBubble]}>
+                        <Markdown style={markdownStyles}>{m.content}</Markdown>
+                      </View>
+                    </View>
+                  ))}
 
-              {loading && !streaming ? (
-                <View style={styles.loaderRow}>
-                  <ActivityIndicator size="small" color="#fff" />
-                  <Text style={styles.loaderText}>Thinking…</Text>
-                </View>
-              ) : null}
+                  {loading && !streaming ? (
+                    <View style={[styles.bubbleRow, styles.aiRow]}>
+                      <AIBadge />
+                      <View style={[styles.bubble, styles.loaderBubble]}>
+                        <View style={styles.loaderPulse} />
+                      </View>
+                    </View>
+                  ) : null}
 
-              {streaming ? (
-                <View style={[styles.bubbleRow, styles.aiRow]}>
-                  <View style={[styles.bubble, styles.aiBubble]}>
-                    <Markdown style={markdownStyles}>{streamText || '…'}</Markdown>
-                  </View>
-                </View>
-              ) : null}
-            </ScrollView>
+                  {streaming ? (
+                    <View style={[styles.bubbleRow, styles.aiRow]}>
+                      <AIBadge />
+                      <View style={[styles.bubble, styles.aiBubble]}>
+                        <View style={styles.streamingRow}>
+                          <Markdown style={markdownStyles}>{streamText || ' '}</Markdown>
+                          <Text style={[styles.cursor, !blinkOn && styles.cursorHidden]}>📍</Text>
+                        </View>
+                      </View>
+                    </View>
+                  ) : null}
+                </ScrollView>
 
-            <View style={styles.inputRow}>
-              <TextInput
-                style={styles.input}
-                value={input}
-                onChangeText={setInput}
-                multiline
-                placeholder="Ask the tour guide..."
-                placeholderTextColor="#9ca3af"
-                editable={!streaming}
-              />
-              <Pressable
-                style={[styles.sendButton, streaming ? styles.sendButtonDisabled : null]}
-                onPress={() => sendPrompt()}
-                disabled={streaming}
-              >
-                <Text style={styles.sendButtonText}>Send</Text>
-              </Pressable>
-            </View>
+                <View style={styles.inputRow}>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      {
+                        height: Math.max(40, Math.min(108, inputHeight)),
+                        borderRadius: inputHeight > 54 ? 8 : 999,
+                      },
+                    ]}
+                    value={input}
+                    onChangeText={setInput}
+                    onContentSizeChange={(e) => setInputHeight(e.nativeEvent.contentSize.height + 8)}
+                    multiline
+                    placeholder="Ask the tour guide..."
+                    placeholderTextColor="#9ca3af"
+                    editable={!streaming}
+                    autoFocus={!isDesktopLayout}
+                    onSubmitEditing={() => {
+                      if (!streaming) sendPrompt();
+                    }}
+                    blurOnSubmit={false}
+                  />
+                  <Pressable
+                    style={[styles.sendButton, streaming ? styles.sendButtonDisabled : null]}
+                    onPress={() => sendPrompt()}
+                    disabled={streaming}
+                  >
+                    <Text style={styles.sendButtonText}>Send</Text>
+                  </Pressable>
+                </View>
+              </>
+            )}
           </View>
         </KeyboardAvoidingView>
       </View>
@@ -342,82 +402,94 @@ const styles = StyleSheet.create({
   map: { ...StyleSheet.absoluteFillObject },
   chatWrap: {
     position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    maxHeight: '56%',
-    paddingHorizontal: 12,
-    paddingBottom: 10,
   },
   chatPanel: {
-    backgroundColor: 'rgba(17,24,39,0.92)',
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: 'rgba(148,163,184,0.28)',
+    flex: 1,
+    backgroundColor: 'rgba(31,41,55,0.90)',
+    borderRadius: 8,
     overflow: 'hidden',
   },
-  messages: {
-    maxHeight: 360,
-  },
-  messagesContent: {
-    padding: 12,
-    gap: 10,
-  },
-  bubbleRow: { flexDirection: 'row' },
-  aiRow: { justifyContent: 'flex-start' },
-  userRow: { justifyContent: 'flex-end' },
-  bubble: {
-    maxWidth: '86%',
-    borderRadius: 18,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  aiBubble: { backgroundColor: 'rgba(30,41,59,0.95)' },
-  userBubble: { backgroundColor: '#374151' },
-  inputRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    gap: 8,
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(148,163,184,0.22)',
-  },
-  input: {
+  centerState: {
     flex: 1,
-    minHeight: 40,
-    maxHeight: 110,
-    color: '#fff',
-    backgroundColor: '#1f2937',
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
   },
-  sendButton: {
-    backgroundColor: '#2563eb',
-    borderRadius: 18,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-  },
-  sendButtonDisabled: { opacity: 0.55 },
-  sendButtonText: { color: '#fff', fontWeight: '600' },
-  loaderRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 4 },
-  loaderText: { color: '#cbd5e1', fontSize: 13 },
-  error: {
-    color: '#fecaca',
+  errorBox: {
     backgroundColor: 'rgba(127,29,29,0.45)',
     borderColor: '#7f1d1d',
     borderWidth: 1,
     borderRadius: 8,
-    padding: 8,
-    marginBottom: 8,
+    padding: 12,
+    maxWidth: 360,
   },
+  errorTitle: { color: '#fecaca', fontWeight: '700', marginBottom: 4 },
+  errorBody: { color: '#fee2e2' },
+  messages: { flex: 1 },
+  messagesContent: { paddingHorizontal: 8, paddingVertical: 10, gap: 8 },
+  bubbleRow: { flexDirection: 'row', marginVertical: 4, marginRight: 8 },
+  aiRow: { justifyContent: 'flex-start', alignItems: 'flex-start' },
+  userRow: { justifyContent: 'flex-end' },
+  aiBadgeOuter: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    marginRight: 8,
+    backgroundColor: '#111827',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  aiBadgeIcon: { fontSize: 16 },
+  bubble: {
+    maxWidth: '86%',
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  aiBubble: { backgroundColor: 'transparent' },
+  userBubble: {
+    backgroundColor: '#374151',
+    borderRadius: 999,
+    paddingHorizontal: 14,
+  },
+  loaderBubble: { backgroundColor: '#111827', borderRadius: 999, paddingVertical: 12, paddingHorizontal: 16 },
+  loaderPulse: {
+    width: 80,
+    height: 10,
+    borderRadius: 999,
+    backgroundColor: '#374151',
+  },
+  streamingRow: { flexDirection: 'row', alignItems: 'flex-end' },
+  cursor: { marginLeft: 4, color: '#fff' },
+  cursorHidden: { opacity: 0 },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  input: {
+    flex: 1,
+    color: '#fff',
+    backgroundColor: '#374151',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    textAlignVertical: 'center',
+  },
+  sendButton: {
+    alignSelf: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  sendButtonDisabled: { opacity: 0.5 },
+  sendButtonText: { color: '#fff', fontSize: 15 },
 });
 
 const markdownStyles = {
   body: { color: '#e5e7eb', fontSize: 15, lineHeight: 21 },
   paragraph: { marginTop: 0, marginBottom: 6 },
-  heading3: { color: '#f8fafc', marginBottom: 6 },
+  heading3: { color: '#f8fafc', marginBottom: 6, fontWeight: '700', fontSize: 18 },
   list_item: { color: '#e5e7eb' },
   code_inline: { backgroundColor: '#0f172a', color: '#c7d2fe', borderRadius: 4 },
   code_block: { backgroundColor: '#0f172a', color: '#c7d2fe', borderRadius: 8, padding: 8 },
