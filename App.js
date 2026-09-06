@@ -18,6 +18,7 @@ import * as Location from 'expo-location';
 import MapView, { Marker } from 'react-native-maps';
 import Markdown from 'react-native-markdown-display';
 import { WebView } from 'react-native-webview';
+import { createSseParser } from './sseParser';
 
 const API_BASE = (process.env.EXPO_PUBLIC_API_BASE || 'https://tourapi.torb.uk').replace(/\/$/, '');
 const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
@@ -263,32 +264,26 @@ export default function App() {
       xhrRef.current = xhr;
 
       let cursor = 0;
-      let pendingLineBuffer = '';
-      let eventName = null;
-      let eventData = '';
       let streamedText = '';
       let receivedChatStop = false;
+      const parser = createSseParser();
 
-      const flushEvent = () => {
-        if (!eventName) {
-          eventData = '';
-          return;
-        }
-        const data = eventData.replace(/\n$/, '');
+      const handleEvent = (sseEvent) => {
+        const data = sseEvent.data;
 
-        if (eventName === 'chat_stream') {
+        if (sseEvent.event === 'chat_stream') {
           setLoading(false);
           setStreaming(true);
           streamedText += data;
           setStreamText((prev) => prev + data);
-        } else if (eventName === 'chat_stop') {
+        } else if (sseEvent.event === 'chat_stop') {
           receivedChatStop = true;
           setLoading(false);
           setStreaming(false);
           setStreamText('');
           setMessages((prev) => [...prev, { role: ROLE.ai, content: data || streamedText }]);
           streamedText = '';
-        } else if (eventName === 'move_map') {
+        } else if (sseEvent.event === 'move_map') {
           const payload = parseMoveMapPayload(data);
           if (payload) {
             addMarker(payload.lat, payload.lng, payload.label);
@@ -296,22 +291,12 @@ export default function App() {
             flyTo(payload.lat, payload.lng, payload.label);
           }
         }
-
-        eventName = null;
-        eventData = '';
       };
 
       xhr.onreadystatechange = () => {
         if (xhr.readyState === XMLHttpRequest.DONE) {
-          if (pendingLineBuffer.trim() || eventName || eventData) {
-            const residual = pendingLineBuffer;
-            pendingLineBuffer = '';
-            if (residual.startsWith('event:')) {
-              eventName = residual.slice(6).trim();
-            } else if (residual.startsWith('data:')) {
-              eventData += residual.slice(5).trimStart() + '\n';
-            }
-            flushEvent();
+          for (const sseEvent of parser.end()) {
+            handleEvent(sseEvent);
           }
 
           if (!receivedChatStop && streamedText.trim()) {
@@ -339,19 +324,8 @@ export default function App() {
         const chunk = xhr.responseText.slice(cursor);
         cursor = xhr.responseText.length;
         if (!chunk) return;
-
-        pendingLineBuffer += chunk;
-        const lines = pendingLineBuffer.split(/\r?\n/);
-        pendingLineBuffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          if (line.startsWith('event:')) {
-            eventName = line.slice(6).trim();
-          } else if (line.startsWith('data:')) {
-            eventData += line.slice(5).trimStart() + '\n';
-          } else if (line.trim() === '') {
-            flushEvent();
-          }
+        for (const sseEvent of parser.push(chunk)) {
+          handleEvent(sseEvent);
         }
       };
 
@@ -551,7 +525,9 @@ export default function App() {
                       <AIBadge />
                       <View style={[styles.bubble, styles.aiBubble]}>
                         <View style={styles.streamingRow}>
-                          <Markdown style={markdownStyles}>{streamText || ' '}</Markdown>
+                          <View style={styles.streamingMarkdown}>
+                            <Markdown style={markdownStyles}>{streamText || ' '}</Markdown>
+                          </View>
                           <Text style={[styles.cursor, !blinkOn && styles.cursorHidden]}>📍</Text>
                         </View>
                       </View>
@@ -669,6 +645,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#374151',
   },
   streamingRow: { flexDirection: 'row', alignItems: 'flex-end' },
+  streamingMarkdown: { flex: 1, minWidth: 0 },
   cursor: { marginLeft: 4, color: '#fff' },
   cursorHidden: { opacity: 0 },
   inputRow: {
