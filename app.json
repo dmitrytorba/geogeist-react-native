@@ -10,19 +10,19 @@
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#0b1220"
     },
     "ios": {
       "supportsTablet": true
     },
     "android": {
-      "package": "com.dmitrytorba.geogeist",
+      "package": "com.torba.d.geogeist",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#0b1220"
       },
       "edgeToEdgeEnabled": true,
-      "versionCode": 2
+      "versionCode": 11
     },
     "web": {
       "favicon": "./assets/favicon.png"

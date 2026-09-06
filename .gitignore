@@ -33,6 +33,12 @@ yarn-error.*
 # local env files
 .env*.local
 
+# Play Console / signing secrets (never commit)
+play-service-account.json
+credentials.json
+keys/*.txt
+keys/*.pem
+
 # typescript
 *.tsbuildinfo
 

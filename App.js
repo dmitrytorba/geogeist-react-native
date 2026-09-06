@@ -2,6 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -20,6 +21,12 @@ import { WebView } from 'react-native-webview';
 
 const API_BASE = (process.env.EXPO_PUBLIC_API_BASE || 'https://tourapi.torb.uk').replace(/\/$/, '');
 const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
+const GOOGLE_MAPS_ANDROID_API_KEY =
+  process.env.EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_API_KEY ||
+  process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ||
+  process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY ||
+  '';
+const HAS_NATIVE_MAP_KEY = Boolean(GOOGLE_MAPS_ANDROID_API_KEY);
 
 const DEFAULT_REGION = {
   latitude: 37.6191,
@@ -167,6 +174,8 @@ export default function App() {
   const [hasBootstrapped, setHasBootstrapped] = useState(false);
   const [use3DMap, setUse3DMap] = useState(Boolean(GOOGLE_MAPS_TILE_API_KEY));
   const [map3DError, setMap3DError] = useState(null);
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
 
   const currentLocation = useMemo(() => {
     if (!region?.latitude || !region?.longitude) return null;
@@ -254,8 +263,11 @@ export default function App() {
       xhrRef.current = xhr;
 
       let cursor = 0;
+      let pendingLineBuffer = '';
       let eventName = null;
       let eventData = '';
+      let streamedText = '';
+      let receivedChatStop = false;
 
       const flushEvent = () => {
         if (!eventName) {
@@ -267,12 +279,15 @@ export default function App() {
         if (eventName === 'chat_stream') {
           setLoading(false);
           setStreaming(true);
+          streamedText += data;
           setStreamText((prev) => prev + data);
         } else if (eventName === 'chat_stop') {
+          receivedChatStop = true;
           setLoading(false);
           setStreaming(false);
           setStreamText('');
-          setMessages((prev) => [...prev, { role: ROLE.ai, content: data }]);
+          setMessages((prev) => [...prev, { role: ROLE.ai, content: data || streamedText }]);
+          streamedText = '';
         } else if (eventName === 'move_map') {
           const payload = parseMoveMapPayload(data);
           if (payload) {
@@ -288,6 +303,21 @@ export default function App() {
 
       xhr.onreadystatechange = () => {
         if (xhr.readyState === XMLHttpRequest.DONE) {
+          if (pendingLineBuffer.trim() || eventName || eventData) {
+            const residual = pendingLineBuffer;
+            pendingLineBuffer = '';
+            if (residual.startsWith('event:')) {
+              eventName = residual.slice(6).trim();
+            } else if (residual.startsWith('data:')) {
+              eventData += residual.slice(5).trimStart() + '\n';
+            }
+            flushEvent();
+          }
+
+          if (!receivedChatStop && streamedText.trim()) {
+            setMessages((prev) => [...prev, { role: ROLE.ai, content: streamedText }]);
+          }
+
           setLoading(false);
           setStreaming(false);
           setStreamText('');
@@ -308,7 +338,11 @@ export default function App() {
       xhr.onprogress = () => {
         const chunk = xhr.responseText.slice(cursor);
         cursor = xhr.responseText.length;
-        const lines = chunk.split(/\r?\n/);
+        if (!chunk) return;
+
+        pendingLineBuffer += chunk;
+        const lines = pendingLineBuffer.split(/\r?\n/);
+        pendingLineBuffer = lines.pop() ?? '';
 
         for (const line of lines) {
           if (line.startsWith('event:')) {
@@ -389,9 +423,36 @@ export default function App() {
     scrollRef.current?.scrollToEnd({ animated: true });
   }, [messages, streamText, loading]);
 
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const showSub = Keyboard.addListener(showEvent, (event) => {
+      setKeyboardOpen(true);
+      setKeyboardHeight(event?.endCoordinates?.height ?? 0);
+    });
+
+    const hideSub = Keyboard.addListener(hideEvent, () => {
+      setKeyboardOpen(false);
+      setKeyboardHeight(0);
+    });
+
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
   const panelPositionStyle = isDesktopLayout
     ? { left: 0, bottom: 0, top: 0, width: '34%', padding: 16 }
-    : { left: 0, right: 0, bottom: 0, height: '50%', paddingHorizontal: 8, paddingBottom: 10 };
+    : {
+        left: 0,
+        right: 0,
+        bottom: keyboardOpen ? keyboardHeight : 0,
+        height: keyboardOpen ? '62%' : '50%',
+        paddingHorizontal: 8,
+        paddingBottom: 10,
+      };
 
   return (
     <SafeAreaView style={styles.root}>
@@ -416,7 +477,7 @@ export default function App() {
               } catch {}
             }}
           />
-        ) : (
+        ) : HAS_NATIVE_MAP_KEY ? (
           <MapView
             ref={mapRef}
             style={styles.map}
@@ -433,11 +494,16 @@ export default function App() {
               />
             ))}
           </MapView>
+        ) : (
+          <View style={[styles.map, { alignItems: 'center', justifyContent: 'center', backgroundColor: '#020617', padding: 16 }]}>
+            <Text style={[styles.errorTitle, { textAlign: 'center' }]}>Map is unavailable in this build</Text>
+            <Text style={[styles.errorBody, { textAlign: 'center', marginTop: 8 }]}>Missing Google Maps Android API key. Set EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_API_KEY in EAS env and rebuild.</Text>
+          </View>
         )}
 
         <KeyboardAvoidingView
           style={[styles.chatWrap, panelPositionStyle]}
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         >
           <View style={styles.chatPanel}>
             {!messages.length && !streaming ? (
@@ -493,6 +559,13 @@ export default function App() {
                   ) : null}
                 </ScrollView>
 
+                {error ? (
+                  <View style={[styles.errorBox, { marginHorizontal: 8, marginBottom: 4 }]}>
+                    <Text style={styles.errorTitle}>Chat connection failed</Text>
+                    <Text style={styles.errorBody}>{error}</Text>
+                  </View>
+                ) : null}
+
                 <View style={styles.inputRow}>
                   <TextInput
                     style={[
@@ -509,7 +582,7 @@ export default function App() {
                     placeholder="Ask the tour guide..."
                     placeholderTextColor="#9ca3af"
                     editable={!streaming}
-                    autoFocus={!isDesktopLayout}
+                    autoFocus={false}
                     onSubmitEditing={() => {
                       if (!streaming) sendPrompt();
                     }}
