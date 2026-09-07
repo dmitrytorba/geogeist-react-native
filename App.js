@@ -18,7 +18,12 @@ import * as Location from 'expo-location';
 import MapView, { Marker } from 'react-native-maps';
 import Markdown from 'react-native-markdown-display';
 import { WebView } from 'react-native-webview';
+import * as SecureStore from 'expo-secure-store';
 import { createSseParser } from './sseParser';
+import { createAuthApi } from './authApi';
+import { createSessionStore } from './sessionStore';
+import { canSendPrompt, shouldBootstrap } from './chatGate';
+import LoginScreen from './LoginScreen';
 
 const API_BASE = (process.env.EXPO_PUBLIC_API_BASE || 'https://tourapi.torb.uk').replace(/\/$/, '');
 const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
@@ -38,6 +43,13 @@ const DEFAULT_REGION = {
 
 const ROLE = { human: 'human', ai: 'ai' };
 const BLINK_MS = 420;
+
+const session = createSessionStore({
+  getItem: (key) => SecureStore.getItemAsync(key),
+  setItem: (key, value) => SecureStore.setItemAsync(key, value),
+  removeItem: (key) => SecureStore.deleteItemAsync(key),
+});
+const authApi = createAuthApi();
 
 function parseMoveMapPayload(raw) {
   try {
@@ -177,6 +189,10 @@ export default function App() {
   const [map3DError, setMap3DError] = useState(null);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [user, setUser] = useState(null);
+  const [token, setToken] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [llmKey, setLlmKey] = useState(null);
 
   const currentLocation = useMemo(() => {
     if (!region?.latitude || !region?.longitude) return null;
@@ -244,6 +260,7 @@ export default function App() {
 
   const sendPrompt = useCallback(
     (textOverride = null) => {
+      if (!canSendPrompt({ user, llmKey })) return;
       if (!currentLocation) return;
 
       const content = textOverride ?? input;
@@ -332,6 +349,8 @@ export default function App() {
       xhr.open('POST', `${API_BASE}/stream/`);
       xhr.setRequestHeader('Content-Type', 'application/json; charset=utf-8');
       xhr.setRequestHeader('Accept', 'text/event-stream');
+      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      if (llmKey) xhr.setRequestHeader('X-LLM-Api-Key', llmKey);
       xhr.send(
         JSON.stringify({
           content: isBootstrap ? 'hi' : content,
@@ -347,8 +366,47 @@ export default function App() {
         setInputHeight(40);
       }
     },
-    [addMarker, cleanupStream, currentLocation, flyTo, hasBootstrapped, input, messages, postWebViewMapEvent]
+    [addMarker, cleanupStream, currentLocation, flyTo, hasBootstrapped, input, llmKey, messages, postWebViewMapEvent, token, user]
   );
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const stored = await session.getToken();
+      if (!active) return;
+      if (!stored) {
+        setAuthReady(true);
+        return;
+      }
+      const result = await authApi.me(stored);
+      if (!active) return;
+      if (result.ok) {
+        setToken(stored);
+        setUser(result.user);
+      } else {
+        await session.clear();
+      }
+      setAuthReady(true);
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleAuthenticated = useCallback(async (result) => {
+    await session.setToken(result.token);
+    setToken(result.token);
+    setUser(result.user);
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    await authApi.logout(token);
+    await session.clear();
+    setToken(null);
+    setUser(null);
+    setMessages([]);
+    setHasBootstrapped(false);
+  }, [token]);
 
   useEffect(() => {
     const t = setInterval(() => setBlinkOn((v) => !v), BLINK_MS);
@@ -388,10 +446,18 @@ export default function App() {
   }, [addMarker, cleanupStream, fallbackToIpCoords, flyTo, postWebViewMapEvent]);
 
   useEffect(() => {
-    if (!loading && currentLocation && !hasBootstrapped) {
+    if (
+      shouldBootstrap({
+        user,
+        llmKey,
+        hasBootstrapped,
+        currentLocation,
+      }) &&
+      !loading
+    ) {
       sendPrompt('__bootstrap__');
     }
-  }, [currentLocation, hasBootstrapped, loading, sendPrompt]);
+  }, [currentLocation, hasBootstrapped, llmKey, loading, sendPrompt, user]);
 
   useEffect(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
@@ -480,7 +546,13 @@ export default function App() {
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         >
           <View style={styles.chatPanel}>
-            {!messages.length && !streaming ? (
+            {!authReady ? (
+              <View style={styles.centerState}>
+                <ActivityIndicator size="large" color="#fff" />
+              </View>
+            ) : !user ? (
+              <LoginScreen api={authApi} onAuthenticated={handleAuthenticated} />
+            ) : !messages.length && !streaming ? (
               <View style={styles.centerState}>
                 {error ? (
                   <View style={styles.errorBox}>
@@ -493,7 +565,13 @@ export default function App() {
                     <Text style={styles.errorBody}>{map3DError}</Text>
                   </View>
                 ) : (
-                  <ActivityIndicator size="large" color="#fff" />
+                  <>
+                    <ActivityIndicator size="large" color="#fff" />
+                    <Text style={styles.signedInHint}>Signed in as {user.email}. Chat stays off until you add an API key.</Text>
+                    <Pressable onPress={handleLogout}>
+                      <Text style={styles.logoutText}>Log out</Text>
+                    </Pressable>
+                  </>
                 )}
               </View>
             ) : (
@@ -557,17 +635,17 @@ export default function App() {
                     multiline
                     placeholder="Ask the tour guide..."
                     placeholderTextColor="#9ca3af"
-                    editable={!streaming}
+                    editable={!streaming && canSendPrompt({ user, llmKey })}
                     autoFocus={false}
                     onSubmitEditing={() => {
-                      if (!streaming) sendPrompt();
+                      if (!streaming && canSendPrompt({ user, llmKey })) sendPrompt();
                     }}
                     blurOnSubmit={false}
                   />
                   <Pressable
-                    style={[styles.sendButton, streaming ? styles.sendButtonDisabled : null]}
+                    style={[styles.sendButton, streaming || !canSendPrompt({ user, llmKey }) ? styles.sendButtonDisabled : null]}
                     onPress={() => sendPrompt()}
-                    disabled={streaming}
+                    disabled={streaming || !canSendPrompt({ user, llmKey })}
                   >
                     <Text style={styles.sendButtonText}>Send</Text>
                   </Pressable>
@@ -670,6 +748,8 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: { opacity: 0.5 },
   sendButtonText: { color: '#fff', fontSize: 15 },
+  signedInHint: { color: '#cbd5e1', textAlign: 'center', marginTop: 12, paddingHorizontal: 16 },
+  logoutText: { color: '#93c5fd', textAlign: 'center', marginTop: 12 },
 });
 
 const markdownStyles = {
