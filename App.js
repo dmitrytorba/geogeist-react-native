@@ -24,6 +24,8 @@ import { createAuthApi } from './authApi';
 import { createSessionStore } from './sessionStore';
 import { canSendPrompt, shouldBootstrap } from './chatGate';
 import LoginScreen from './LoginScreen';
+import KeySettings from './KeySettings';
+import { createKeyStore, isLlmKeyRequired, streamHeaders } from './keyStore';
 
 const API_BASE = (process.env.EXPO_PUBLIC_API_BASE || 'https://tourapi.torb.uk').replace(/\/$/, '');
 const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
@@ -50,6 +52,11 @@ const session = createSessionStore({
   removeItem: (key) => SecureStore.deleteItemAsync(key),
 });
 const authApi = createAuthApi();
+const keyStore = createKeyStore({
+  getItem: (key) => SecureStore.getItemAsync(key),
+  setItem: (key, value) => SecureStore.setItemAsync(key, value),
+  removeItem: (key) => SecureStore.deleteItemAsync(key),
+});
 
 function parseMoveMapPayload(raw) {
   try {
@@ -193,6 +200,9 @@ export default function App() {
   const [token, setToken] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [llmKey, setLlmKey] = useState(null);
+  const [llmBaseUrl, setLlmBaseUrl] = useState(null);
+  const [googleKey, setGoogleKey] = useState(null);
+  const [forceKeyScreen, setForceKeyScreen] = useState(false);
 
   const currentLocation = useMemo(() => {
     if (!region?.latitude || !region?.longitude) return null;
@@ -325,7 +335,18 @@ export default function App() {
           setStreamText('');
           xhrRef.current = null;
           if (xhr.status >= 400) {
-            setError('Tour backend returned an error.');
+            let body = {};
+            try {
+              body = JSON.parse(xhr.responseText || '{}');
+            } catch {
+              body = {};
+            }
+            if (isLlmKeyRequired(xhr.status, body)) {
+              setForceKeyScreen(true);
+              setError('Add your OpenAI API key to continue.');
+            } else {
+              setError('Tour backend returned an error.');
+            }
           }
         }
       };
@@ -347,10 +368,8 @@ export default function App() {
       };
 
       xhr.open('POST', `${API_BASE}/stream/`);
-      xhr.setRequestHeader('Content-Type', 'application/json; charset=utf-8');
-      xhr.setRequestHeader('Accept', 'text/event-stream');
-      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-      if (llmKey) xhr.setRequestHeader('X-LLM-Api-Key', llmKey);
+      const headers = streamHeaders({ token, llmKey, llmBaseUrl, googleKey });
+      Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value));
       xhr.send(
         JSON.stringify({
           content: isBootstrap ? 'hi' : content,
@@ -366,14 +385,18 @@ export default function App() {
         setInputHeight(40);
       }
     },
-    [addMarker, cleanupStream, currentLocation, flyTo, hasBootstrapped, input, llmKey, messages, postWebViewMapEvent, token, user]
+    [addMarker, cleanupStream, currentLocation, flyTo, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, postWebViewMapEvent, token, user]
   );
 
   useEffect(() => {
     let active = true;
     (async () => {
       const stored = await session.getToken();
+      const keys = await keyStore.load();
       if (!active) return;
+      setLlmKey(keys.llmKey);
+      setLlmBaseUrl(keys.llmBaseUrl);
+      setGoogleKey(keys.googleKey);
       if (!stored) {
         setAuthReady(true);
         return;
@@ -406,7 +429,24 @@ export default function App() {
     setUser(null);
     setMessages([]);
     setHasBootstrapped(false);
+    setForceKeyScreen(false);
   }, [token]);
+
+  const handleSaveKeys = useCallback(async (next) => {
+    await keyStore.save(next);
+    setLlmKey(next.llmKey);
+    setLlmBaseUrl(next.llmBaseUrl);
+    setGoogleKey(next.googleKey);
+    setForceKeyScreen(false);
+  }, []);
+
+  const handleDeleteKeys = useCallback(async () => {
+    await keyStore.clear();
+    setLlmKey(null);
+    setLlmBaseUrl(null);
+    setGoogleKey(null);
+    setForceKeyScreen(true);
+  }, []);
 
   useEffect(() => {
     const t = setInterval(() => setBlinkOn((v) => !v), BLINK_MS);
@@ -552,6 +592,12 @@ export default function App() {
               </View>
             ) : !user ? (
               <LoginScreen api={authApi} onAuthenticated={handleAuthenticated} />
+            ) : !llmKey || forceKeyScreen ? (
+              <KeySettings
+                initial={{ llmKey, llmBaseUrl, googleKey }}
+                onSave={handleSaveKeys}
+                onDelete={handleDeleteKeys}
+              />
             ) : !messages.length && !streaming ? (
               <View style={styles.centerState}>
                 {error ? (
