@@ -25,6 +25,8 @@ import { createSessionStore } from './sessionStore';
 import { canSendPrompt, shouldBootstrap } from './chatGate';
 import LoginScreen from './LoginScreen';
 import KeySettings from './KeySettings';
+import ProfileScreen from './ProfileScreen';
+import { createToursApi, mapTourMessage, shouldSkipBootstrapOnResume } from './toursApi';
 import { createKeyStore, isLlmKeyRequired, streamHeaders } from './keyStore';
 
 const API_BASE = (process.env.EXPO_PUBLIC_API_BASE || 'https://tourapi.torb.uk').replace(/\/$/, '');
@@ -52,6 +54,7 @@ const session = createSessionStore({
   removeItem: (key) => SecureStore.deleteItemAsync(key),
 });
 const authApi = createAuthApi();
+const toursApi = createToursApi();
 const keyStore = createKeyStore({
   getItem: (key) => SecureStore.getItemAsync(key),
   setItem: (key, value) => SecureStore.setItemAsync(key, value),
@@ -203,6 +206,9 @@ export default function App() {
   const [llmBaseUrl, setLlmBaseUrl] = useState(null);
   const [googleKey, setGoogleKey] = useState(null);
   const [forceKeyScreen, setForceKeyScreen] = useState(false);
+  const [tours, setTours] = useState([]);
+  const [tourId, setTourId] = useState(null);
+  const [showProfile, setShowProfile] = useState(false);
 
   const currentLocation = useMemo(() => {
     if (!region?.latitude || !region?.longitude) return null;
@@ -347,6 +353,13 @@ export default function App() {
             } else {
               setError('Tour backend returned an error.');
             }
+          } else if (token) {
+            toursApi.list(token).then((listed) => {
+              if (listed.ok && Array.isArray(listed.data)) {
+                setTours(listed.data);
+                setTourId((current) => current || listed.data[0]?.id || null);
+              }
+            });
           }
         }
       };
@@ -375,6 +388,7 @@ export default function App() {
           content: isBootstrap ? 'hi' : content,
           user_location: currentLocation,
           history: messages,
+          ...(tourId ? { tour_id: tourId } : {}),
         })
       );
 
@@ -385,7 +399,7 @@ export default function App() {
         setInputHeight(40);
       }
     },
-    [addMarker, cleanupStream, currentLocation, flyTo, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, postWebViewMapEvent, token, user]
+    [addMarker, cleanupStream, currentLocation, flyTo, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, postWebViewMapEvent, token, tourId, user]
   );
 
   useEffect(() => {
@@ -406,6 +420,10 @@ export default function App() {
       if (result.ok) {
         setToken(stored);
         setUser(result.user);
+        const listed = await toursApi.list(stored);
+        if (active && listed.ok && Array.isArray(listed.data)) {
+          setTours(listed.data);
+        }
       } else {
         await session.clear();
       }
@@ -416,11 +434,23 @@ export default function App() {
     };
   }, []);
 
+  const refreshTours = useCallback(async (sessionToken) => {
+    const t = sessionToken || token;
+    if (!t) return [];
+    const result = await toursApi.list(t);
+    if (result.ok && Array.isArray(result.data)) {
+      setTours(result.data);
+      return result.data;
+    }
+    return [];
+  }, [token]);
+
   const handleAuthenticated = useCallback(async (result) => {
     await session.setToken(result.token);
     setToken(result.token);
     setUser(result.user);
-  }, []);
+    await refreshTours(result.token);
+  }, [refreshTours]);
 
   const handleLogout = useCallback(async () => {
     await authApi.logout(token);
@@ -430,6 +460,9 @@ export default function App() {
     setMessages([]);
     setHasBootstrapped(false);
     setForceKeyScreen(false);
+    setTourId(null);
+    setTours([]);
+    setShowProfile(false);
   }, [token]);
 
   const handleSaveKeys = useCallback(async (next) => {
@@ -447,6 +480,43 @@ export default function App() {
     setGoogleKey(null);
     setForceKeyScreen(true);
   }, []);
+
+  const handleSavePrefs = useCallback(async (payload) => {
+    if (!token) return;
+    const result = await toursApi.patchMe(token, payload);
+    if (result.ok) setUser(result.data);
+  }, [token]);
+
+  const handleResumeTour = useCallback(async (tour) => {
+    if (!token || !tour?.id) return;
+    const result = await toursApi.get(token, tour.id);
+    if (!result.ok) return;
+    const detail = result.data;
+    setTourId(detail.id);
+    setHasBootstrapped(true);
+    setMessages((detail.messages || []).map(mapTourMessage));
+    setShowProfile(false);
+    if (Number.isFinite(detail.lat) && Number.isFinite(detail.lng)) {
+      flyTo(detail.lat, detail.lng, detail.title || 'Tour');
+    }
+  }, [flyTo, token]);
+
+  const handleRenameTour = useCallback(async (id, title) => {
+    if (!token) return;
+    await toursApi.patch(token, id, title);
+    await refreshTours();
+  }, [refreshTours, token]);
+
+  const handleDeleteTour = useCallback(async (id) => {
+    if (!token) return;
+    await toursApi.remove(token, id);
+    if (tourId === id) {
+      setTourId(null);
+      setMessages([]);
+      setHasBootstrapped(false);
+    }
+    await refreshTours();
+  }, [refreshTours, token, tourId]);
 
   useEffect(() => {
     const t = setInterval(() => setBlinkOn((v) => !v), BLINK_MS);
@@ -493,11 +563,12 @@ export default function App() {
         hasBootstrapped,
         currentLocation,
       }) &&
+      !shouldSkipBootstrapOnResume(tourId) &&
       !loading
     ) {
       sendPrompt('__bootstrap__');
     }
-  }, [currentLocation, hasBootstrapped, llmKey, loading, sendPrompt, user]);
+  }, [currentLocation, hasBootstrapped, llmKey, loading, sendPrompt, tourId, user]);
 
   useEffect(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
@@ -592,6 +663,17 @@ export default function App() {
               </View>
             ) : !user ? (
               <LoginScreen api={authApi} onAuthenticated={handleAuthenticated} />
+            ) : showProfile ? (
+              <ProfileScreen
+                user={user}
+                tours={tours}
+                onSavePrefs={handleSavePrefs}
+                onResume={handleResumeTour}
+                onRename={handleRenameTour}
+                onDelete={handleDeleteTour}
+                onLogout={handleLogout}
+                onClose={() => setShowProfile(false)}
+              />
             ) : !llmKey || forceKeyScreen ? (
               <KeySettings
                 initial={{ llmKey, llmBaseUrl, googleKey }}
@@ -616,6 +698,9 @@ export default function App() {
                     <Text style={styles.signedInHint}>Signed in as {user.email}. Chat stays off until you add an API key.</Text>
                     <Pressable onPress={handleLogout}>
                       <Text style={styles.logoutText}>Log out</Text>
+                    </Pressable>
+                    <Pressable onPress={() => setShowProfile(true)}>
+                      <Text style={styles.logoutText}>Profile</Text>
                     </Pressable>
                   </>
                 )}
@@ -665,6 +750,10 @@ export default function App() {
                     <Text style={styles.errorBody}>{error}</Text>
                   </View>
                 ) : null}
+
+                <Pressable onPress={() => setShowProfile(true)} style={{ paddingHorizontal: 12, paddingTop: 8 }}>
+                  <Text style={styles.logoutText}>Profile · {user.email}</Text>
+                </Pressable>
 
                 <View style={styles.inputRow}>
                   <TextInput
