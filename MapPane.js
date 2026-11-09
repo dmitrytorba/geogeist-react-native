@@ -7,8 +7,12 @@ import { DEFAULT_REGION, GOOGLE_MAPS_TILE_API_KEY, HAS_NATIVE_MAP_KEY } from './
 
 // Cesium 3D tiles when a tile key is set, else the native map, else a notice.
 // The parent moves the camera through the ref: moveTo(region, lat, lng, label).
-const MapPane = forwardRef(function MapPane({ region, markers, bottomPadding, onMap3DError }, ref) {
+// The native map is uncontrolled: a `region` prop would snap the camera back
+// over the user's pans on every re-render and fight animateToRegion.
+const MapPane = forwardRef(function MapPane({ markers, bottomPadding, onMap3DError }, ref) {
   const mapRef = useRef(null);
+  // Last flyTo target, so a native map that mounts later (3D fallback) opens there.
+  const lastRegionRef = useRef(DEFAULT_REGION);
   const webViewRef = useRef(null);
   const webViewReadyRef = useRef(false);
   const pendingWebViewMessagesRef = useRef([]);
@@ -22,6 +26,7 @@ const MapPane = forwardRef(function MapPane({ region, markers, bottomPadding, on
     ref,
     () => ({
       moveTo(next, lat, lng, label) {
+        lastRegionRef.current = next;
         mapRef.current?.animateToRegion(next, 1400);
         if (!use3DMap) return;
         const message = JSON.stringify({ type: 'move_map', lat, lng, label });
@@ -69,8 +74,7 @@ const MapPane = forwardRef(function MapPane({ region, markers, bottomPadding, on
         ref={mapRef}
         style={styles.map}
         mapType="hybrid"
-        initialRegion={DEFAULT_REGION}
-        region={region}
+        initialRegion={lastRegionRef.current}
         mapPadding={{ top: 0, right: 0, bottom: bottomPadding, left: 0 }}
       >
         {markers.map((marker) => (

@@ -25,7 +25,6 @@ export default function App() {
   const { width, height } = useWindowDimensions();
   const isDesktopLayout = width >= 768;
 
-  const [region, setRegion] = useState(DEFAULT_REGION);
   const [markers, setMarkers] = useState([]);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -38,7 +37,7 @@ export default function App() {
   const { user, token, authReady, llmKey, llmBaseUrl, googleKey, forceKeyScreen, tours, refreshTours, signOut } = account;
 
   // The backend prompt treats user_location as the map center. Track the real
-  // point, not `region`, which is shifted south to clear the chat overlay.
+  // point, not the camera region, which is shifted south to clear the chat overlay.
   const [mapCenter, setMapCenter] = useState({
     latitude: DEFAULT_REGION.latitude,
     longitude: DEFAULT_REGION.longitude,
@@ -62,7 +61,6 @@ export default function App() {
       latitudeDelta: 0.08,
       longitudeDelta: 0.08,
     };
-    setRegion(next);
     setMapCenter({ latitude: lat, longitude: lng });
     mapPaneRef.current?.moveTo(next, lat, lng, label);
   }, []);
@@ -268,7 +266,6 @@ export default function App() {
       <View style={styles.container}>
         <MapPane
           ref={mapPaneRef}
-          region={region}
           markers={markers}
           bottomPadding={isDesktopLayout ? 0 : Math.round(height * 0.45)}
           onMap3DError={setMap3DError}
