@@ -87,3 +87,23 @@ describe('chat gate', () => {
     );
   });
 });
+
+describe('network failures', () => {
+  const offline = async () => {
+    throw new TypeError('Network request failed');
+  };
+
+  it('login resolves with a connection error instead of throwing', async () => {
+    const api = createAuthApi(offline, 'https://tourapi.torb.uk');
+    const result = await api.login('a@b.co', 'password1');
+    assert.equal(result.ok, false);
+    assert.match(result.error, /reach the server/);
+  });
+
+  it('me reports status 0 so callers keep the stored session', async () => {
+    const api = createAuthApi(offline, 'https://tourapi.torb.uk');
+    const result = await api.me('gg_u_abc');
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 0);
+  });
+});

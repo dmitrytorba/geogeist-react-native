@@ -1,4 +1,4 @@
-const { apiBase } = require('./config');
+const { createJsonClient } = require('./httpClient');
 
 function mapTourMessage(message) {
   const role = message.role === 'assistant' || message.role === 'ai' ? 'ai' : 'human';
@@ -10,26 +10,7 @@ function shouldSkipBootstrapOnResume(tourId) {
 }
 
 function createToursApi(fetchImpl, baseUrl) {
-  const fetchFn = fetchImpl || fetch;
-  const root = (baseUrl || apiBase()).replace(/\/$/, '');
-
-  async function request(path, { method = 'GET', token, body } = {}) {
-    const headers = { Accept: 'application/json' };
-    if (token) headers.Authorization = `Bearer ${token}`;
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
-    const res = await fetchFn(`${root}${path}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    let data = {};
-    try {
-      data = await res.json();
-    } catch {
-      data = {};
-    }
-    return { ok: res.ok, status: res.status, data };
-  }
+  const request = createJsonClient(fetchImpl, baseUrl);
 
   return {
     async list(token) {

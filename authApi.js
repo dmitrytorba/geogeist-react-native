@@ -1,4 +1,4 @@
-const { apiBase } = require('./config');
+const { createJsonClient } = require('./httpClient');
 
 function mapAuthError(status, body) {
   const code = body && body.error;
@@ -14,33 +14,14 @@ function mapAuthError(status, body) {
   if (code === 'invalid_email') {
     return 'Enter a valid email address.';
   }
+  if (status === 0 || code === 'network_error') {
+    return 'Could not reach the server. Check your connection.';
+  }
   return 'Could not sign in. Try again.';
 }
 
-async function parseJson(res) {
-  try {
-    return await res.json();
-  } catch {
-    return {};
-  }
-}
-
 function createAuthApi(fetchImpl, baseUrl) {
-  const fetchFn = fetchImpl || fetch;
-  const root = (baseUrl || apiBase()).replace(/\/$/, '');
-
-  async function request(path, { method = 'GET', token, body } = {}) {
-    const headers = { Accept: 'application/json' };
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
-    if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetchFn(`${root}${path}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    const data = await parseJson(res);
-    return { ok: res.ok, status: res.status, data };
-  }
+  const request = createJsonClient(fetchImpl, baseUrl);
 
   return {
     async signup(email, password) {
@@ -70,7 +51,7 @@ function createAuthApi(fetchImpl, baseUrl) {
     async me(token) {
       const result = await request('/me', { token });
       if (!result.ok) {
-        return { ok: false, error: mapAuthError(result.status, result.data) };
+        return { ok: false, status: result.status, error: mapAuthError(result.status, result.data) };
       }
       return { ok: true, user: result.data };
     },

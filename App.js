@@ -1,5 +1,5 @@
 import { StatusBar } from 'expo-status-bar';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Keyboard,
@@ -28,8 +28,10 @@ import KeySettings from './KeySettings';
 import ProfileScreen from './ProfileScreen';
 import { createToursApi, mapTourMessage, shouldSkipBootstrapOnResume } from './toursApi';
 import { createKeyStore, isLlmKeyRequired, streamHeaders } from './keyStore';
+import { parseMoveMapPayload } from './mapPayload';
+import { apiBase } from './config';
 
-const API_BASE = (process.env.EXPO_PUBLIC_API_BASE || 'https://tourapi.torb.uk').replace(/\/$/, '');
+const API_BASE = apiBase();
 const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
 const GOOGLE_MAPS_ANDROID_API_KEY =
   process.env.EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_API_KEY ||
@@ -48,31 +50,15 @@ const DEFAULT_REGION = {
 const ROLE = { human: 'human', ai: 'ai' };
 const BLINK_MS = 420;
 
-const session = createSessionStore({
+const secureBackend = {
   getItem: (key) => SecureStore.getItemAsync(key),
   setItem: (key, value) => SecureStore.setItemAsync(key, value),
   removeItem: (key) => SecureStore.deleteItemAsync(key),
-});
+};
+const session = createSessionStore(secureBackend);
 const authApi = createAuthApi();
 const toursApi = createToursApi();
-const keyStore = createKeyStore({
-  getItem: (key) => SecureStore.getItemAsync(key),
-  setItem: (key, value) => SecureStore.setItemAsync(key, value),
-  removeItem: (key) => SecureStore.deleteItemAsync(key),
-});
-
-function parseMoveMapPayload(raw) {
-  try {
-    const normalized = String(raw || '').replace(/'/g, '"');
-    const data = JSON.parse(normalized);
-    const lat = Number.parseFloat(data.lat);
-    const lng = Number.parseFloat(data.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-    return { lat, lng, label: data.label || 'Point of interest' };
-  } catch {
-    return null;
-  }
-}
+const keyStore = createKeyStore(secureBackend);
 
 function AIBadge() {
   return (
@@ -80,6 +66,30 @@ function AIBadge() {
       <Text style={styles.aiBadgeIcon}>📍</Text>
     </View>
   );
+}
+
+// Memoized so streaming tokens re-render only the live bubble, not every
+// finished message's Markdown tree.
+const MessageBubble = memo(function MessageBubble({ role, content }) {
+  const isHuman = role === ROLE.human;
+  return (
+    <View style={[styles.bubbleRow, isHuman ? styles.userRow : styles.aiRow]}>
+      {isHuman ? null : <AIBadge />}
+      <View style={[styles.bubble, isHuman ? styles.userBubble : styles.aiBubble]}>
+        <Markdown style={markdownStyles}>{content}</Markdown>
+      </View>
+    </View>
+  );
+});
+
+// Owns its own timer so the blink doesn't re-render the whole App.
+function BlinkingCursor() {
+  const [on, setOn] = useState(true);
+  useEffect(() => {
+    const t = setInterval(() => setOn((v) => !v), BLINK_MS);
+    return () => clearInterval(t);
+  }, []);
+  return <Text style={[styles.cursor, !on && styles.cursorHidden]}>📍</Text>;
 }
 
 function buildCesiumHtml(apiKey, center) {
@@ -155,7 +165,12 @@ function buildCesiumHtml(apiKey, center) {
 
           flyTo(${startLat}, ${startLng});
 
-          window.addEventListener('message', (event) => {
+          // react-native-webview posts on document (Android) or window (iOS).
+          // Listen on both; skip the same event if it reaches both.
+          let lastEvent = null;
+          function onMessage(event) {
+            if (event === lastEvent) return;
+            lastEvent = event;
             try {
               const msg = JSON.parse(event.data || '{}');
               if ((msg?.type === 'move_map' || msg?.type === 'you_are_here') && Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
@@ -163,7 +178,9 @@ function buildCesiumHtml(apiKey, center) {
                 flyTo(msg.lat, msg.lng);
               }
             } catch {}
-          });
+          }
+          document.addEventListener('message', onMessage);
+          window.addEventListener('message', onMessage);
 
           window.ReactNativeWebView?.postMessage(JSON.stringify({ type: 'ready' }));
         } catch (error) {
@@ -192,7 +209,6 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState('');
-  const [blinkOn, setBlinkOn] = useState(true);
   const [error, setError] = useState(null);
   const [hasBootstrapped, setHasBootstrapped] = useState(false);
   const [use3DMap, setUse3DMap] = useState(Boolean(GOOGLE_MAPS_TILE_API_KEY));
@@ -210,18 +226,40 @@ export default function App() {
   const [tourId, setTourId] = useState(null);
   const [showProfile, setShowProfile] = useState(false);
 
+  // The backend prompt treats user_location as the map center. Track the real
+  // point, not `region`, which is shifted south to clear the chat overlay.
+  const [mapCenter, setMapCenter] = useState({
+    latitude: DEFAULT_REGION.latitude,
+    longitude: DEFAULT_REGION.longitude,
+  });
   const currentLocation = useMemo(() => {
-    if (!region?.latitude || !region?.longitude) return null;
-    return `${region.latitude},${region.longitude}`;
-  }, [region]);
+    if (!mapCenter?.latitude || !mapCenter?.longitude) return null;
+    return `${mapCenter.latitude},${mapCenter.longitude}`;
+  }, [mapCenter]);
+
+  // Built once: a changing `source` reloads Cesium and drops every marker.
+  // Camera moves after load go through postMessage instead.
+  const cesiumSource = useMemo(() => ({ html: buildCesiumHtml(GOOGLE_MAPS_TILE_API_KEY, DEFAULT_REGION) }), []);
+  const webViewReadyRef = useRef(false);
+  const pendingWebViewMessagesRef = useRef([]);
 
   const postWebViewMapEvent = useCallback((type, lat, lng, label) => {
-    webViewRef.current?.postMessage(JSON.stringify({ type, lat, lng, label }));
+    const message = JSON.stringify({ type, lat, lng, label });
+    if (webViewReadyRef.current && webViewRef.current) {
+      webViewRef.current.postMessage(message);
+    } else {
+      pendingWebViewMessagesRef.current.push(message);
+    }
   }, []);
+
+  // Read through a ref so flyTo stays stable; otherwise a layout or 3D-map
+  // change re-runs the mount-time location effect and aborts the live stream.
+  const viewRef = useRef({ isDesktopLayout, use3DMap });
+  viewRef.current = { isDesktopLayout, use3DMap };
 
   const flyTo = useCallback(
     (lat, lng, label = 'Point of interest') => {
-      const bottomOverlayRatio = isDesktopLayout ? 0 : 0.45;
+      const bottomOverlayRatio = viewRef.current.isDesktopLayout ? 0 : 0.45;
       const latitudeOffset = 0.08 * (bottomOverlayRatio * 0.6);
       const next = {
         latitude: lat - latitudeOffset,
@@ -230,10 +268,11 @@ export default function App() {
         longitudeDelta: 0.08,
       };
       setRegion(next);
+      setMapCenter({ latitude: lat, longitude: lng });
       mapRef.current?.animateToRegion(next, 1400);
-      if (use3DMap) postWebViewMapEvent('move_map', lat, lng, label);
+      if (viewRef.current.use3DMap) postWebViewMapEvent('move_map', lat, lng, label);
     },
-    [isDesktopLayout, postWebViewMapEvent, use3DMap]
+    [postWebViewMapEvent]
   );
 
   const addMarker = useCallback((lat, lng, label) => {
@@ -264,7 +303,6 @@ export default function App() {
       const data = await res.json();
       if (data?.lat && data?.lng) {
         addMarker(data.lat, data.lng, 'You are here');
-        postWebViewMapEvent('you_are_here', data.lat, data.lng, 'You are here');
         flyTo(data.lat, data.lng, 'You are here');
       }
     } catch {
@@ -272,7 +310,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [addMarker, flyTo, postWebViewMapEvent]);
+  }, [addMarker, flyTo]);
 
   const sendPrompt = useCallback(
     (textOverride = null) => {
@@ -320,7 +358,6 @@ export default function App() {
           const payload = parseMoveMapPayload(data);
           if (payload) {
             addMarker(payload.lat, payload.lng, payload.label);
-            postWebViewMapEvent('move_map', payload.lat, payload.lng, payload.label);
             flyTo(payload.lat, payload.lng, payload.label);
           }
         }
@@ -353,7 +390,7 @@ export default function App() {
             } else {
               setError('Tour backend returned an error.');
             }
-          } else if (token) {
+          } else if (xhr.status >= 200 && token) {
             toursApi.list(token).then((listed) => {
               if (listed.ok && Array.isArray(listed.data)) {
                 setTours(listed.data);
@@ -365,6 +402,7 @@ export default function App() {
       };
 
       xhr.onerror = () => {
+        if (xhrRef.current === xhr) xhrRef.current = null;
         setError('Couldn’t reach the tour backend. Check backend URL/auth and try again.');
         setLoading(false);
         setStreaming(false);
@@ -399,14 +437,16 @@ export default function App() {
         setInputHeight(40);
       }
     },
-    [addMarker, cleanupStream, currentLocation, flyTo, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, postWebViewMapEvent, token, tourId, user]
+    [addMarker, cleanupStream, currentLocation, flyTo, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, token, tourId, user]
   );
 
   useEffect(() => {
     let active = true;
     (async () => {
-      const stored = await session.getToken();
-      const keys = await keyStore.load();
+      const [stored, keys] = await Promise.all([
+        session.getToken().catch(() => null),
+        keyStore.load().catch(() => ({ llmKey: null, llmBaseUrl: null, googleKey: null })),
+      ]);
       if (!active) return;
       setLlmKey(keys.llmKey);
       setLlmBaseUrl(keys.llmBaseUrl);
@@ -420,11 +460,12 @@ export default function App() {
       if (result.ok) {
         setToken(stored);
         setUser(result.user);
-        const listed = await toursApi.list(stored);
-        if (active && listed.ok && Array.isArray(listed.data)) {
-          setTours(listed.data);
-        }
-      } else {
+        // Don't hold the UI on the tour list; it fills in when it lands.
+        toursApi.list(stored).then((listed) => {
+          if (active && listed.ok && Array.isArray(listed.data)) setTours(listed.data);
+        });
+      } else if (result.status === 401) {
+        // Only a rejected token is dropped; offline keeps it for next launch.
         await session.clear();
       }
       setAuthReady(true);
@@ -453,6 +494,7 @@ export default function App() {
   }, [refreshTours]);
 
   const handleLogout = useCallback(async () => {
+    cleanupStream();
     await authApi.logout(token);
     await session.clear();
     setToken(null);
@@ -463,7 +505,7 @@ export default function App() {
     setTourId(null);
     setTours([]);
     setShowProfile(false);
-  }, [token]);
+  }, [cleanupStream, token]);
 
   const handleSaveKeys = useCallback(async (next) => {
     await keyStore.save(next);
@@ -519,11 +561,6 @@ export default function App() {
   }, [refreshTours, token, tourId]);
 
   useEffect(() => {
-    const t = setInterval(() => setBlinkOn((v) => !v), BLINK_MS);
-    return () => clearInterval(t);
-  }, []);
-
-  useEffect(() => {
     let active = true;
 
     (async () => {
@@ -541,7 +578,6 @@ export default function App() {
 
         const { latitude, longitude } = current.coords;
         addMarker(latitude, longitude, 'You are here');
-        postWebViewMapEvent('you_are_here', latitude, longitude, 'You are here');
         flyTo(latitude, longitude, 'You are here');
         setLoading(false);
       } catch {
@@ -553,7 +589,7 @@ export default function App() {
       active = false;
       cleanupStream();
     };
-  }, [addMarker, cleanupStream, fallbackToIpCoords, flyTo, postWebViewMapEvent]);
+  }, [addMarker, cleanupStream, fallbackToIpCoords, flyTo]);
 
   useEffect(() => {
     if (
@@ -614,14 +650,19 @@ export default function App() {
             ref={webViewRef}
             style={styles.map}
             originWhitelist={['*']}
-            source={{ html: buildCesiumHtml(GOOGLE_MAPS_TILE_API_KEY, region) }}
+            source={cesiumSource}
             javaScriptEnabled
             domStorageEnabled
             allowsInlineMediaPlayback
             onMessage={(event) => {
               try {
                 const payload = JSON.parse(event.nativeEvent.data || '{}');
-                if (payload?.type === 'error') {
+                if (payload?.type === 'ready') {
+                  webViewReadyRef.current = true;
+                  const pending = pendingWebViewMessagesRef.current;
+                  pendingWebViewMessagesRef.current = [];
+                  pending.forEach((message) => webViewRef.current?.postMessage(message));
+                } else if (payload?.type === 'error') {
                   setMap3DError(payload.message || '3D map failed to load.');
                   setUse3DMap(false);
                 }
@@ -709,15 +750,7 @@ export default function App() {
               <>
                 <ScrollView ref={scrollRef} style={styles.messages} contentContainerStyle={styles.messagesContent}>
                   {messages.map((m, idx) => (
-                    <View
-                      key={`${m.role}-${idx}`}
-                      style={[styles.bubbleRow, m.role === ROLE.human ? styles.userRow : styles.aiRow]}
-                    >
-                      {m.role === ROLE.ai ? <AIBadge /> : null}
-                      <View style={[styles.bubble, m.role === ROLE.human ? styles.userBubble : styles.aiBubble]}>
-                        <Markdown style={markdownStyles}>{m.content}</Markdown>
-                      </View>
-                    </View>
+                    <MessageBubble key={`${m.role}-${idx}`} role={m.role} content={m.content} />
                   ))}
 
                   {loading && !streaming ? (
@@ -737,7 +770,7 @@ export default function App() {
                           <View style={styles.streamingMarkdown}>
                             <Markdown style={markdownStyles}>{streamText || ' '}</Markdown>
                           </View>
-                          <Text style={[styles.cursor, !blinkOn && styles.cursorHidden]}>📍</Text>
+                          <BlinkingCursor />
                         </View>
                       </View>
                     </View>
