@@ -5,8 +5,10 @@ const { parseMoveMapPayload } = require('./mapPayload');
 const XHR_DONE = 4;
 
 // One POST /stream/ request. The backend answers with SSE events:
-// chat_stream (a token), chat_stop (the full reply), move_map (a place).
+// tour (the tour id, sent first), chat_stream (a token), chat_stop (the full
+// reply), move_map (a place).
 // Handlers:
+//   onTour(id)               the tour this request belongs to
 //   onToken(text)            each chat_stream token
 //   onReply(text)            a finished AI reply (chat_stop, or the streamed
 //                            text if the stream ended without chat_stop)
@@ -25,7 +27,9 @@ function startTourStream({ XHR, url, headers = {}, body, handlers = {} }) {
 
   const handleEvent = (sseEvent) => {
     const data = sseEvent.data;
-    if (sseEvent.event === 'chat_stream') {
+    if (sseEvent.event === 'tour') {
+      if (data.trim()) handlers.onTour?.(data.trim());
+    } else if (sseEvent.event === 'chat_stream') {
       streamedText += data;
       handlers.onToken?.(data);
     } else if (sseEvent.event === 'chat_stop') {

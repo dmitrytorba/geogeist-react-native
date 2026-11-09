@@ -3,7 +3,8 @@ import { startTourStream } from './tourStream';
 
 // React state around startTourStream. Callbacks are read through a ref so
 // `start` and `cancel` stay stable across renders.
-// options: onReply(text), onMoveMap(payload), onKeyRequired(), onSuccess()
+// options: onTour(id), onReply(text), onMoveMap(payload), onKeyRequired(),
+// onSuccess(), onSettled() (request over: finished, failed, or unreachable)
 export default function useTourStream(options) {
   const optionsRef = useRef(options);
   optionsRef.current = options;
@@ -40,6 +41,7 @@ export default function useTourStream(options) {
         headers,
         body,
         handlers: {
+          onTour: (id) => optionsRef.current.onTour?.(id),
           onToken: (data) => {
             setLoading(false);
             setStreaming(true);
@@ -53,6 +55,7 @@ export default function useTourStream(options) {
           onEnd: () => {
             reset();
             streamRef.current = null;
+            optionsRef.current.onSettled?.();
           },
           onFailure: ({ keyRequired }) => {
             if (keyRequired) {
@@ -67,6 +70,7 @@ export default function useTourStream(options) {
             if (streamRef.current === stream) streamRef.current = null;
             setError('Couldn’t reach the tour backend. Check backend URL/auth and try again.');
             reset();
+            optionsRef.current.onSettled?.();
           },
         },
       });

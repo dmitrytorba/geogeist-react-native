@@ -12,7 +12,7 @@ import ChatView, { ROLE } from './ChatView';
 import useAccount from './useAccount';
 import useTourStream from './useTourStream';
 import { authApi, toursApi } from './services';
-import { mapTourMessage, shouldSkipBootstrapOnResume } from './toursApi';
+import { BOOTSTRAP_PROMPT, mapTourMessages, shouldSkipBootstrapOnResume } from './toursApi';
 import { streamHeaders } from './keyStore';
 import { DEFAULT_REGION } from './mapConfig';
 import { apiBase } from './config';
@@ -31,6 +31,9 @@ export default function App() {
   const [hasBootstrapped, setHasBootstrapped] = useState(false);
   const [map3DError, setMap3DError] = useState(null);
   const [tourId, setTourId] = useState(null);
+  // True while a request that creates a new tour has not yet named it. A send
+  // in that window would create a second tour, so it waits.
+  const [awaitingTourId, setAwaitingTourId] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
 
   const account = useAccount();
@@ -70,19 +73,22 @@ export default function App() {
   }, []);
 
   const stream = useTourStream({
+    onTour: (id) => {
+      setTourId(id);
+      setAwaitingTourId(false);
+    },
+    onSettled: () => setAwaitingTourId(false),
     onReply: (content) => setMessages((prev) => [...prev, { role: ROLE.ai, content }]),
     onMoveMap: ({ lat, lng, label }) => {
       addMarker(lat, lng, label);
       flyTo(lat, lng, label);
     },
     onKeyRequired: () => account.setForceKeyScreen(true),
+    // Refresh the profile screen's list; the tour id comes from the stream.
     onSuccess: () => {
       if (!token) return;
       toursApi.list(token).then((listed) => {
-        if (listed.ok && Array.isArray(listed.data)) {
-          account.setTours(listed.data);
-          setTourId((current) => current || listed.data[0]?.id || null);
-        }
+        if (listed.ok && Array.isArray(listed.data)) account.setTours(listed.data);
       });
     },
   });
@@ -108,6 +114,7 @@ export default function App() {
     (textOverride = null) => {
       if (!canSendPrompt({ user, llmKey })) return false;
       if (!currentLocation) return false;
+      if (!tourId && awaitingTourId) return false;
 
       const content = textOverride ?? input;
       const isBootstrap = !hasBootstrapped && (textOverride === '__bootstrap__' || !content.trim());
@@ -119,12 +126,14 @@ export default function App() {
         url: `${API_BASE}/stream/`,
         headers: streamHeaders({ token, llmKey, llmBaseUrl, googleKey }),
         body: {
-          content: isBootstrap ? 'hi' : content,
+          content: isBootstrap ? BOOTSTRAP_PROMPT : content,
           user_location: currentLocation,
           history: messages,
+          ...(isBootstrap ? { bootstrap: true } : {}),
           ...(tourId ? { tour_id: tourId } : {}),
         },
       });
+      if (!tourId) setAwaitingTourId(true);
 
       if (isBootstrap) {
         setHasBootstrapped(true);
@@ -133,7 +142,7 @@ export default function App() {
       setInput('');
       return true;
     },
-    [currentLocation, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, startStream, token, tourId, user]
+    [awaitingTourId, currentLocation, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, startStream, token, tourId, user]
   );
 
   const handleLogout = useCallback(async () => {
@@ -142,6 +151,7 @@ export default function App() {
     setMessages([]);
     setHasBootstrapped(false);
     setTourId(null);
+    setAwaitingTourId(false);
     setShowProfile(false);
   }, [cleanupStream, signOut]);
 
@@ -150,14 +160,17 @@ export default function App() {
     const result = await toursApi.get(token, tour.id);
     if (!result.ok) return;
     const detail = result.data;
+    // A reply still streaming belongs to the conversation being left.
+    cleanupStream();
+    setAwaitingTourId(false);
     setTourId(detail.id);
     setHasBootstrapped(true);
-    setMessages((detail.messages || []).map(mapTourMessage));
+    setMessages(mapTourMessages(detail.messages));
     setShowProfile(false);
     if (Number.isFinite(detail.lat) && Number.isFinite(detail.lng)) {
       flyTo(detail.lat, detail.lng, detail.title || 'Tour');
     }
-  }, [flyTo, token]);
+  }, [cleanupStream, flyTo, token]);
 
   const handleRenameTour = useCallback(async (id, title) => {
     if (!token) return;
@@ -250,7 +263,7 @@ export default function App() {
         error={stream.error}
         map3DError={map3DError}
         userEmail={user.email}
-        canSend={canSendPrompt({ user, llmKey })}
+        canSend={canSendPrompt({ user, llmKey }) && !awaitingTourId}
         input={input}
         onChangeInput={setInput}
         onSend={() => sendPrompt()}

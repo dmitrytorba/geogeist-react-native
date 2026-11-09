@@ -43,7 +43,7 @@ class FakeXhr {
 function record() {
   const calls = [];
   const handlers = {};
-  for (const name of ['onToken', 'onReply', 'onMoveMap', 'onEnd', 'onFailure', 'onSuccess', 'onNetworkError']) {
+  for (const name of ['onTour', 'onToken', 'onReply', 'onMoveMap', 'onEnd', 'onFailure', 'onSuccess', 'onNetworkError']) {
     handlers[name] = (arg) => calls.push(arg === undefined ? [name] : [name, arg]);
   }
   return { calls, handlers };
@@ -128,6 +128,28 @@ describe('startTourStream', () => {
     const xhr = start(handlers);
     xhr.push(`event: move_map\ndata: {'lat': '38.5', 'lng': '-121.5', 'label': 'Folsom Dam'}\n\n`);
     assert.deepEqual(calls, [['onMoveMap', { lat: 38.5, lng: -121.5, label: 'Folsom Dam' }]]);
+  });
+
+  it('tour event reports the tour id before any tokens', () => {
+    const { calls, handlers } = record();
+    const xhr = start(handlers);
+    xhr.push('event: tour\ndata: 7f3c2a\n\nevent: chat_stream\ndata: Hi\n\n');
+    assert.deepEqual(calls, [['onTour', '7f3c2a'], ['onToken', 'Hi']]);
+  });
+
+  it('tour event split across chunks still reports the id once', () => {
+    const { calls, handlers } = record();
+    const xhr = start(handlers);
+    xhr.push('event: tour\nda');
+    xhr.push('ta: 7f3c2a\n\n');
+    assert.deepEqual(calls, [['onTour', '7f3c2a']]);
+  });
+
+  it('empty tour event is ignored', () => {
+    const { calls, handlers } = record();
+    const xhr = start(handlers);
+    xhr.push('event: tour\ndata:\n\n');
+    assert.deepEqual(calls, []);
   });
 
   it('move_map with an unparseable payload is ignored', () => {

@@ -1,6 +1,6 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { createToursApi, mapTourMessage, shouldSkipBootstrapOnResume } = require('./toursApi');
+const { createToursApi, mapTourMessage, mapTourMessages, shouldSkipBootstrapOnResume } = require('./toursApi');
 
 describe('tour resume', () => {
   it('maps assistant messages into native ai bubbles', () => {
@@ -8,6 +8,27 @@ describe('tour resume', () => {
       role: 'ai',
       content: 'Hello river',
     });
+  });
+
+  it('drops a leading bootstrap hi from older saved tours', () => {
+    const resumed = mapTourMessages([
+      { role: 'human', content: 'hi' },
+      { role: 'assistant', content: 'Welcome to Folsom' },
+      { role: 'human', content: 'hi' },
+    ]);
+    assert.deepEqual(resumed, [
+      { role: 'ai', content: 'Welcome to Folsom' },
+      { role: 'human', content: 'hi' },
+    ]);
+  });
+
+  it('keeps a leading real question when resuming', () => {
+    const resumed = mapTourMessages([
+      { role: 'human', content: 'Tell me about the dam' },
+      { role: 'assistant', content: 'Built in 1955' },
+    ]);
+    assert.equal(resumed.length, 2);
+    assert.deepEqual(mapTourMessages(undefined), []);
   });
 
   it('skips bootstrap intro when resuming a tour', () => {
