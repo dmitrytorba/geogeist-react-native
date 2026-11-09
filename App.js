@@ -1,202 +1,26 @@
 import { StatusBar } from 'expo-status-bar';
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  Keyboard,
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  SafeAreaView,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  useWindowDimensions,
-  View,
-} from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, SafeAreaView, StyleSheet, useWindowDimensions, View } from 'react-native';
 import * as Location from 'expo-location';
-import MapView, { Marker } from 'react-native-maps';
-import Markdown from 'react-native-markdown-display';
-import { WebView } from 'react-native-webview';
-import * as SecureStore from 'expo-secure-store';
-import { createSseParser } from './sseParser';
-import { createAuthApi } from './authApi';
-import { createSessionStore } from './sessionStore';
 import { canSendPrompt, shouldBootstrap } from './chatGate';
 import LoginScreen from './LoginScreen';
 import KeySettings from './KeySettings';
 import ProfileScreen from './ProfileScreen';
-import { createToursApi, mapTourMessage, shouldSkipBootstrapOnResume } from './toursApi';
-import { createKeyStore, isLlmKeyRequired, streamHeaders } from './keyStore';
-import { parseMoveMapPayload } from './mapPayload';
+import MapPane from './MapPane';
+import ChatPanel from './ChatPanel';
+import ChatView, { ROLE } from './ChatView';
+import useAccount from './useAccount';
+import useTourStream from './useTourStream';
+import { authApi, toursApi } from './services';
+import { mapTourMessage, shouldSkipBootstrapOnResume } from './toursApi';
+import { streamHeaders } from './keyStore';
+import { DEFAULT_REGION } from './mapConfig';
 import { apiBase } from './config';
 
 const API_BASE = apiBase();
-const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
-const GOOGLE_MAPS_ANDROID_API_KEY =
-  process.env.EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_API_KEY ||
-  process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ||
-  process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY ||
-  '';
-const HAS_NATIVE_MAP_KEY = Boolean(GOOGLE_MAPS_ANDROID_API_KEY);
-
-const DEFAULT_REGION = {
-  latitude: 37.6191,
-  longitude: -122.3816,
-  latitudeDelta: 8,
-  longitudeDelta: 8,
-};
-
-const ROLE = { human: 'human', ai: 'ai' };
-const BLINK_MS = 420;
-
-const secureBackend = {
-  getItem: (key) => SecureStore.getItemAsync(key),
-  setItem: (key, value) => SecureStore.setItemAsync(key, value),
-  removeItem: (key) => SecureStore.deleteItemAsync(key),
-};
-const session = createSessionStore(secureBackend);
-const authApi = createAuthApi();
-const toursApi = createToursApi();
-const keyStore = createKeyStore(secureBackend);
-
-function AIBadge() {
-  return (
-    <View style={styles.aiBadgeOuter}>
-      <Text style={styles.aiBadgeIcon}>📍</Text>
-    </View>
-  );
-}
-
-// Memoized so streaming tokens re-render only the live bubble, not every
-// finished message's Markdown tree.
-const MessageBubble = memo(function MessageBubble({ role, content }) {
-  const isHuman = role === ROLE.human;
-  return (
-    <View style={[styles.bubbleRow, isHuman ? styles.userRow : styles.aiRow]}>
-      {isHuman ? null : <AIBadge />}
-      <View style={[styles.bubble, isHuman ? styles.userBubble : styles.aiBubble]}>
-        <Markdown style={markdownStyles}>{content}</Markdown>
-      </View>
-    </View>
-  );
-});
-
-// Owns its own timer so the blink doesn't re-render the whole App.
-function BlinkingCursor() {
-  const [on, setOn] = useState(true);
-  useEffect(() => {
-    const t = setInterval(() => setOn((v) => !v), BLINK_MS);
-    return () => clearInterval(t);
-  }, []);
-  return <Text style={[styles.cursor, !on && styles.cursorHidden]}>📍</Text>;
-}
-
-function buildCesiumHtml(apiKey, center) {
-  const startLat = Number(center?.latitude) || DEFAULT_REGION.latitude;
-  const startLng = Number(center?.longitude) || DEFAULT_REGION.longitude;
-
-  return `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-    <link href="https://cesium.com/downloads/cesiumjs/releases/1.127/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
-    <style>
-      html, body, #cesiumContainer { margin: 0; width: 100%; height: 100%; background: #020617; overflow: hidden; }
-      .cesium-viewer-bottom, .cesium-credit-textContainer { display: none !important; }
-    </style>
-  </head>
-  <body>
-    <div id="cesiumContainer"></div>
-    <script src="https://cesium.com/downloads/cesiumjs/releases/1.127/Build/Cesium/Cesium.js"></script>
-    <script>
-      (async function () {
-        try {
-          const viewer = new Cesium.Viewer('cesiumContainer', {
-            animation: false,
-            timeline: false,
-            sceneModePicker: false,
-            navigationHelpButton: false,
-            baseLayerPicker: false,
-            geocoder: false,
-            homeButton: false,
-            fullscreenButton: false,
-            infoBox: false,
-            selectionIndicator: false,
-            shouldAnimate: true,
-            globe: false,
-          });
-
-          const tileset = await Cesium.createGooglePhotorealistic3DTileset({ key: '${apiKey}' });
-          viewer.scene.primitives.add(tileset);
-
-          function addMarker(lat, lng, label) {
-            viewer.entities.add({
-              position: Cesium.Cartesian3.fromDegrees(lng, lat, 40),
-              point: {
-                pixelSize: 10,
-                color: Cesium.Color.fromCssColorString('#22d3ee'),
-                outlineColor: Cesium.Color.fromCssColorString('#082f49'),
-                outlineWidth: 2,
-              },
-              label: {
-                text: label || 'Point of interest',
-                fillColor: Cesium.Color.WHITE,
-                showBackground: true,
-                backgroundColor: Cesium.Color.fromCssColorString('rgba(15,23,42,0.75)'),
-                font: '14px sans-serif',
-                pixelOffset: new Cesium.Cartesian2(0, -18),
-              },
-            });
-          }
-
-          function flyTo(lat, lng) {
-            viewer.camera.flyTo({
-              destination: Cesium.Cartesian3.fromDegrees(lng, lat, 2200),
-              orientation: {
-                heading: 0,
-                pitch: Cesium.Math.toRadians(-55),
-                roll: 0,
-              },
-              duration: 1.3,
-            });
-          }
-
-          flyTo(${startLat}, ${startLng});
-
-          // react-native-webview posts on document (Android) or window (iOS).
-          // Listen on both; skip the same event if it reaches both.
-          let lastEvent = null;
-          function onMessage(event) {
-            if (event === lastEvent) return;
-            lastEvent = event;
-            try {
-              const msg = JSON.parse(event.data || '{}');
-              if ((msg?.type === 'move_map' || msg?.type === 'you_are_here') && Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
-                addMarker(msg.lat, msg.lng, msg.label);
-                flyTo(msg.lat, msg.lng);
-              }
-            } catch {}
-          }
-          document.addEventListener('message', onMessage);
-          window.addEventListener('message', onMessage);
-
-          window.ReactNativeWebView?.postMessage(JSON.stringify({ type: 'ready' }));
-        } catch (error) {
-          window.ReactNativeWebView?.postMessage(JSON.stringify({ type: 'error', message: String(error?.message || error) }));
-        }
-      })();
-    </script>
-  </body>
-</html>`;
-}
 
 export default function App() {
-  const mapRef = useRef(null);
-  const webViewRef = useRef(null);
-  const scrollRef = useRef(null);
-  const xhrRef = useRef(null);
+  const mapPaneRef = useRef(null);
 
   const { width, height } = useWindowDimensions();
   const isDesktopLayout = width >= 768;
@@ -205,26 +29,13 @@ export default function App() {
   const [markers, setMarkers] = useState([]);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
-  const [inputHeight, setInputHeight] = useState(40);
-  const [loading, setLoading] = useState(true);
-  const [streaming, setStreaming] = useState(false);
-  const [streamText, setStreamText] = useState('');
-  const [error, setError] = useState(null);
   const [hasBootstrapped, setHasBootstrapped] = useState(false);
-  const [use3DMap, setUse3DMap] = useState(Boolean(GOOGLE_MAPS_TILE_API_KEY));
   const [map3DError, setMap3DError] = useState(null);
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const [user, setUser] = useState(null);
-  const [token, setToken] = useState(null);
-  const [authReady, setAuthReady] = useState(false);
-  const [llmKey, setLlmKey] = useState(null);
-  const [llmBaseUrl, setLlmBaseUrl] = useState(null);
-  const [googleKey, setGoogleKey] = useState(null);
-  const [forceKeyScreen, setForceKeyScreen] = useState(false);
-  const [tours, setTours] = useState([]);
   const [tourId, setTourId] = useState(null);
   const [showProfile, setShowProfile] = useState(false);
+
+  const account = useAccount();
+  const { user, token, authReady, llmKey, llmBaseUrl, googleKey, forceKeyScreen, tours, refreshTours, signOut } = account;
 
   // The backend prompt treats user_location as the map center. Track the real
   // point, not `region`, which is shifted south to clear the chat overlay.
@@ -237,65 +48,47 @@ export default function App() {
     return `${mapCenter.latitude},${mapCenter.longitude}`;
   }, [mapCenter]);
 
-  // Built once: a changing `source` reloads Cesium and drops every marker.
-  // Camera moves after load go through postMessage instead.
-  const cesiumSource = useMemo(() => ({ html: buildCesiumHtml(GOOGLE_MAPS_TILE_API_KEY, DEFAULT_REGION) }), []);
-  const webViewReadyRef = useRef(false);
-  const pendingWebViewMessagesRef = useRef([]);
+  // Read through a ref so flyTo stays stable; otherwise a layout change
+  // re-runs the mount-time location effect.
+  const isDesktopLayoutRef = useRef(isDesktopLayout);
+  isDesktopLayoutRef.current = isDesktopLayout;
 
-  const postWebViewMapEvent = useCallback((type, lat, lng, label) => {
-    const message = JSON.stringify({ type, lat, lng, label });
-    if (webViewReadyRef.current && webViewRef.current) {
-      webViewRef.current.postMessage(message);
-    } else {
-      pendingWebViewMessagesRef.current.push(message);
-    }
+  const flyTo = useCallback((lat, lng, label = 'Point of interest') => {
+    const bottomOverlayRatio = isDesktopLayoutRef.current ? 0 : 0.45;
+    const latitudeOffset = 0.08 * (bottomOverlayRatio * 0.6);
+    const next = {
+      latitude: lat - latitudeOffset,
+      longitude: lng,
+      latitudeDelta: 0.08,
+      longitudeDelta: 0.08,
+    };
+    setRegion(next);
+    setMapCenter({ latitude: lat, longitude: lng });
+    mapPaneRef.current?.moveTo(next, lat, lng, label);
   }, []);
-
-  // Read through a ref so flyTo stays stable; otherwise a layout or 3D-map
-  // change re-runs the mount-time location effect and aborts the live stream.
-  const viewRef = useRef({ isDesktopLayout, use3DMap });
-  viewRef.current = { isDesktopLayout, use3DMap };
-
-  const flyTo = useCallback(
-    (lat, lng, label = 'Point of interest') => {
-      const bottomOverlayRatio = viewRef.current.isDesktopLayout ? 0 : 0.45;
-      const latitudeOffset = 0.08 * (bottomOverlayRatio * 0.6);
-      const next = {
-        latitude: lat - latitudeOffset,
-        longitude: lng,
-        latitudeDelta: 0.08,
-        longitudeDelta: 0.08,
-      };
-      setRegion(next);
-      setMapCenter({ latitude: lat, longitude: lng });
-      mapRef.current?.animateToRegion(next, 1400);
-      if (viewRef.current.use3DMap) postWebViewMapEvent('move_map', lat, lng, label);
-    },
-    [postWebViewMapEvent]
-  );
 
   const addMarker = useCallback((lat, lng, label) => {
-    setMarkers((prev) => [
-      ...prev,
-      {
-        id: `${Date.now()}-${Math.random()}`,
-        latitude: lat,
-        longitude: lng,
-        label,
-      },
-    ]);
+    setMarkers((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, latitude: lat, longitude: lng, label }]);
   }, []);
 
-  const cleanupStream = useCallback(() => {
-    if (xhrRef.current) {
-      xhrRef.current.onreadystatechange = null;
-      xhrRef.current.onprogress = null;
-      xhrRef.current.onerror = null;
-      xhrRef.current.abort();
-      xhrRef.current = null;
-    }
-  }, []);
+  const stream = useTourStream({
+    onReply: (content) => setMessages((prev) => [...prev, { role: ROLE.ai, content }]),
+    onMoveMap: ({ lat, lng, label }) => {
+      addMarker(lat, lng, label);
+      flyTo(lat, lng, label);
+    },
+    onKeyRequired: () => account.setForceKeyScreen(true),
+    onSuccess: () => {
+      if (!token) return;
+      toursApi.list(token).then((listed) => {
+        if (listed.ok && Array.isArray(listed.data)) {
+          account.setTours(listed.data);
+          setTourId((current) => current || listed.data[0]?.id || null);
+        }
+      });
+    },
+  });
+  const { loading, setLoading, setError, start: startStream, cancel: cleanupStream } = stream;
 
   const fallbackToIpCoords = useCallback(async () => {
     try {
@@ -310,224 +103,49 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [addMarker, flyTo]);
+  }, [addMarker, flyTo, setError, setLoading]);
 
+  // Returns true when a typed message went out (so the input can reset).
   const sendPrompt = useCallback(
     (textOverride = null) => {
-      if (!canSendPrompt({ user, llmKey })) return;
-      if (!currentLocation) return;
+      if (!canSendPrompt({ user, llmKey })) return false;
+      if (!currentLocation) return false;
 
       const content = textOverride ?? input;
       const isBootstrap = !hasBootstrapped && (textOverride === '__bootstrap__' || !content.trim());
-      if (!isBootstrap && !content.trim()) return;
+      if (!isBootstrap && !content.trim()) return false;
 
-      setError(null);
-      setLoading(true);
-      setStreaming(false);
-      setStreamText('');
+      if (!isBootstrap) setMessages((prev) => [...prev, { role: ROLE.human, content }]);
 
-      if (!isBootstrap && content.trim()) {
-        setMessages((prev) => [...prev, { role: ROLE.human, content }]);
-      }
-
-      cleanupStream();
-      const xhr = new XMLHttpRequest();
-      xhrRef.current = xhr;
-
-      let cursor = 0;
-      let streamedText = '';
-      let receivedChatStop = false;
-      const parser = createSseParser();
-
-      const handleEvent = (sseEvent) => {
-        const data = sseEvent.data;
-
-        if (sseEvent.event === 'chat_stream') {
-          setLoading(false);
-          setStreaming(true);
-          streamedText += data;
-          setStreamText((prev) => prev + data);
-        } else if (sseEvent.event === 'chat_stop') {
-          receivedChatStop = true;
-          setLoading(false);
-          setStreaming(false);
-          setStreamText('');
-          setMessages((prev) => [...prev, { role: ROLE.ai, content: data || streamedText }]);
-          streamedText = '';
-        } else if (sseEvent.event === 'move_map') {
-          const payload = parseMoveMapPayload(data);
-          if (payload) {
-            addMarker(payload.lat, payload.lng, payload.label);
-            flyTo(payload.lat, payload.lng, payload.label);
-          }
-        }
-      };
-
-      xhr.onreadystatechange = () => {
-        if (xhr.readyState === XMLHttpRequest.DONE) {
-          for (const sseEvent of parser.end()) {
-            handleEvent(sseEvent);
-          }
-
-          if (!receivedChatStop && streamedText.trim()) {
-            setMessages((prev) => [...prev, { role: ROLE.ai, content: streamedText }]);
-          }
-
-          setLoading(false);
-          setStreaming(false);
-          setStreamText('');
-          xhrRef.current = null;
-          if (xhr.status >= 400) {
-            let body = {};
-            try {
-              body = JSON.parse(xhr.responseText || '{}');
-            } catch {
-              body = {};
-            }
-            if (isLlmKeyRequired(xhr.status, body)) {
-              setForceKeyScreen(true);
-              setError('Add your OpenAI API key to continue.');
-            } else {
-              setError('Tour backend returned an error.');
-            }
-          } else if (xhr.status >= 200 && token) {
-            toursApi.list(token).then((listed) => {
-              if (listed.ok && Array.isArray(listed.data)) {
-                setTours(listed.data);
-                setTourId((current) => current || listed.data[0]?.id || null);
-              }
-            });
-          }
-        }
-      };
-
-      xhr.onerror = () => {
-        if (xhrRef.current === xhr) xhrRef.current = null;
-        setError('Couldn’t reach the tour backend. Check backend URL/auth and try again.');
-        setLoading(false);
-        setStreaming(false);
-        setStreamText('');
-      };
-
-      xhr.onprogress = () => {
-        const chunk = xhr.responseText.slice(cursor);
-        cursor = xhr.responseText.length;
-        if (!chunk) return;
-        for (const sseEvent of parser.push(chunk)) {
-          handleEvent(sseEvent);
-        }
-      };
-
-      xhr.open('POST', `${API_BASE}/stream/`);
-      const headers = streamHeaders({ token, llmKey, llmBaseUrl, googleKey });
-      Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value));
-      xhr.send(
-        JSON.stringify({
+      startStream({
+        url: `${API_BASE}/stream/`,
+        headers: streamHeaders({ token, llmKey, llmBaseUrl, googleKey }),
+        body: {
           content: isBootstrap ? 'hi' : content,
           user_location: currentLocation,
           history: messages,
           ...(tourId ? { tour_id: tourId } : {}),
-        })
-      );
+        },
+      });
 
-      if (isBootstrap) setHasBootstrapped(true);
-
-      if (!isBootstrap) {
-        setInput('');
-        setInputHeight(40);
+      if (isBootstrap) {
+        setHasBootstrapped(true);
+        return false;
       }
+      setInput('');
+      return true;
     },
-    [addMarker, cleanupStream, currentLocation, flyTo, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, token, tourId, user]
+    [currentLocation, googleKey, hasBootstrapped, input, llmBaseUrl, llmKey, messages, startStream, token, tourId, user]
   );
-
-  useEffect(() => {
-    let active = true;
-    (async () => {
-      const [stored, keys] = await Promise.all([
-        session.getToken().catch(() => null),
-        keyStore.load().catch(() => ({ llmKey: null, llmBaseUrl: null, googleKey: null })),
-      ]);
-      if (!active) return;
-      setLlmKey(keys.llmKey);
-      setLlmBaseUrl(keys.llmBaseUrl);
-      setGoogleKey(keys.googleKey);
-      if (!stored) {
-        setAuthReady(true);
-        return;
-      }
-      const result = await authApi.me(stored);
-      if (!active) return;
-      if (result.ok) {
-        setToken(stored);
-        setUser(result.user);
-        // Don't hold the UI on the tour list; it fills in when it lands.
-        toursApi.list(stored).then((listed) => {
-          if (active && listed.ok && Array.isArray(listed.data)) setTours(listed.data);
-        });
-      } else if (result.status === 401) {
-        // Only a rejected token is dropped; offline keeps it for next launch.
-        await session.clear();
-      }
-      setAuthReady(true);
-    })();
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  const refreshTours = useCallback(async (sessionToken) => {
-    const t = sessionToken || token;
-    if (!t) return [];
-    const result = await toursApi.list(t);
-    if (result.ok && Array.isArray(result.data)) {
-      setTours(result.data);
-      return result.data;
-    }
-    return [];
-  }, [token]);
-
-  const handleAuthenticated = useCallback(async (result) => {
-    await session.setToken(result.token);
-    setToken(result.token);
-    setUser(result.user);
-    await refreshTours(result.token);
-  }, [refreshTours]);
 
   const handleLogout = useCallback(async () => {
     cleanupStream();
-    await authApi.logout(token);
-    await session.clear();
-    setToken(null);
-    setUser(null);
+    await signOut();
     setMessages([]);
     setHasBootstrapped(false);
-    setForceKeyScreen(false);
     setTourId(null);
-    setTours([]);
     setShowProfile(false);
-  }, [cleanupStream, token]);
-
-  const handleSaveKeys = useCallback(async (next) => {
-    await keyStore.save(next);
-    setLlmKey(next.llmKey);
-    setLlmBaseUrl(next.llmBaseUrl);
-    setGoogleKey(next.googleKey);
-    setForceKeyScreen(false);
-  }, []);
-
-  const handleDeleteKeys = useCallback(async () => {
-    await keyStore.clear();
-    setLlmKey(null);
-    setLlmBaseUrl(null);
-    setGoogleKey(null);
-    setForceKeyScreen(true);
-  }, []);
-
-  const handleSavePrefs = useCallback(async (payload) => {
-    if (!token) return;
-    const result = await toursApi.patchMe(token, payload);
-    if (result.ok) setUser(result.data);
-  }, [token]);
+  }, [cleanupStream, signOut]);
 
   const handleResumeTour = useCallback(async (tour) => {
     if (!token || !tour?.id) return;
@@ -587,18 +205,12 @@ export default function App() {
 
     return () => {
       active = false;
-      cleanupStream();
     };
-  }, [addMarker, cleanupStream, fallbackToIpCoords, flyTo]);
+  }, [addMarker, fallbackToIpCoords, flyTo, setLoading]);
 
   useEffect(() => {
     if (
-      shouldBootstrap({
-        user,
-        llmKey,
-        hasBootstrapped,
-        currentLocation,
-      }) &&
+      shouldBootstrap({ user, llmKey, hasBootstrapped, currentLocation }) &&
       !shouldSkipBootstrapOnResume(tourId) &&
       !loading
     ) {
@@ -606,222 +218,62 @@ export default function App() {
     }
   }, [currentLocation, hasBootstrapped, llmKey, loading, sendPrompt, tourId, user]);
 
-  useEffect(() => {
-    scrollRef.current?.scrollToEnd({ animated: true });
-  }, [messages, streamText, loading]);
-
-  useEffect(() => {
-    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
-    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
-
-    const showSub = Keyboard.addListener(showEvent, (event) => {
-      setKeyboardOpen(true);
-      setKeyboardHeight(event?.endCoordinates?.height ?? 0);
-    });
-
-    const hideSub = Keyboard.addListener(hideEvent, () => {
-      setKeyboardOpen(false);
-      setKeyboardHeight(0);
-    });
-
-    return () => {
-      showSub.remove();
-      hideSub.remove();
-    };
-  }, []);
-
-  const panelPositionStyle = isDesktopLayout
-    ? { left: 0, bottom: 0, top: 0, width: '34%', padding: 16 }
-    : {
-        left: 0,
-        right: 0,
-        bottom: keyboardOpen ? keyboardHeight : 0,
-        height: keyboardOpen ? '62%' : '50%',
-        paddingHorizontal: 8,
-        paddingBottom: 10,
-      };
+  let panel;
+  if (!authReady) {
+    panel = (
+      <View style={styles.centerState}>
+        <ActivityIndicator size="large" color="#fff" />
+      </View>
+    );
+  } else if (!user) {
+    panel = <LoginScreen api={authApi} onAuthenticated={account.signIn} />;
+  } else if (showProfile) {
+    panel = (
+      <ProfileScreen
+        user={user}
+        tours={tours}
+        onSavePrefs={account.savePrefs}
+        onResume={handleResumeTour}
+        onRename={handleRenameTour}
+        onDelete={handleDeleteTour}
+        onLogout={handleLogout}
+        onClose={() => setShowProfile(false)}
+      />
+    );
+  } else if (!llmKey || forceKeyScreen) {
+    panel = <KeySettings initial={{ llmKey, llmBaseUrl, googleKey }} onSave={account.saveKeys} onDelete={account.deleteKeys} />;
+  } else {
+    panel = (
+      <ChatView
+        messages={messages}
+        loading={loading}
+        streaming={stream.streaming}
+        streamText={stream.streamText}
+        error={stream.error}
+        map3DError={map3DError}
+        userEmail={user.email}
+        canSend={canSendPrompt({ user, llmKey })}
+        input={input}
+        onChangeInput={setInput}
+        onSend={() => sendPrompt()}
+        onLogout={handleLogout}
+        onOpenProfile={() => setShowProfile(true)}
+      />
+    );
+  }
 
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar style="light" />
       <View style={styles.container}>
-        {use3DMap ? (
-          <WebView
-            ref={webViewRef}
-            style={styles.map}
-            originWhitelist={['*']}
-            source={cesiumSource}
-            javaScriptEnabled
-            domStorageEnabled
-            allowsInlineMediaPlayback
-            onMessage={(event) => {
-              try {
-                const payload = JSON.parse(event.nativeEvent.data || '{}');
-                if (payload?.type === 'ready') {
-                  webViewReadyRef.current = true;
-                  const pending = pendingWebViewMessagesRef.current;
-                  pendingWebViewMessagesRef.current = [];
-                  pending.forEach((message) => webViewRef.current?.postMessage(message));
-                } else if (payload?.type === 'error') {
-                  setMap3DError(payload.message || '3D map failed to load.');
-                  setUse3DMap(false);
-                }
-              } catch {}
-            }}
-          />
-        ) : HAS_NATIVE_MAP_KEY ? (
-          <MapView
-            ref={mapRef}
-            style={styles.map}
-            mapType="hybrid"
-            initialRegion={DEFAULT_REGION}
-            region={region}
-            mapPadding={{ top: 0, right: 0, bottom: isDesktopLayout ? 0 : Math.round(height * 0.45), left: 0 }}
-          >
-            {markers.map((marker) => (
-              <Marker
-                key={marker.id}
-                coordinate={{ latitude: marker.latitude, longitude: marker.longitude }}
-                title={marker.label}
-              />
-            ))}
-          </MapView>
-        ) : (
-          <View style={[styles.map, { alignItems: 'center', justifyContent: 'center', backgroundColor: '#020617', padding: 16 }]}>
-            <Text style={[styles.errorTitle, { textAlign: 'center' }]}>Map is unavailable in this build</Text>
-            <Text style={[styles.errorBody, { textAlign: 'center', marginTop: 8 }]}>Missing Google Maps Android API key. Set EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_API_KEY in EAS env and rebuild.</Text>
-          </View>
-        )}
-
-        <KeyboardAvoidingView
-          style={[styles.chatWrap, panelPositionStyle]}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        >
-          <View style={styles.chatPanel}>
-            {!authReady ? (
-              <View style={styles.centerState}>
-                <ActivityIndicator size="large" color="#fff" />
-              </View>
-            ) : !user ? (
-              <LoginScreen api={authApi} onAuthenticated={handleAuthenticated} />
-            ) : showProfile ? (
-              <ProfileScreen
-                user={user}
-                tours={tours}
-                onSavePrefs={handleSavePrefs}
-                onResume={handleResumeTour}
-                onRename={handleRenameTour}
-                onDelete={handleDeleteTour}
-                onLogout={handleLogout}
-                onClose={() => setShowProfile(false)}
-              />
-            ) : !llmKey || forceKeyScreen ? (
-              <KeySettings
-                initial={{ llmKey, llmBaseUrl, googleKey }}
-                onSave={handleSaveKeys}
-                onDelete={handleDeleteKeys}
-              />
-            ) : !messages.length && !streaming ? (
-              <View style={styles.centerState}>
-                {error ? (
-                  <View style={styles.errorBox}>
-                    <Text style={styles.errorTitle}>Chat connection failed</Text>
-                    <Text style={styles.errorBody}>{error}</Text>
-                  </View>
-                ) : map3DError ? (
-                  <View style={styles.errorBox}>
-                    <Text style={styles.errorTitle}>3D map disabled</Text>
-                    <Text style={styles.errorBody}>{map3DError}</Text>
-                  </View>
-                ) : (
-                  <>
-                    <ActivityIndicator size="large" color="#fff" />
-                    <Text style={styles.signedInHint}>Signed in as {user.email}. Chat stays off until you add an API key.</Text>
-                    <Pressable onPress={handleLogout}>
-                      <Text style={styles.logoutText}>Log out</Text>
-                    </Pressable>
-                    <Pressable onPress={() => setShowProfile(true)}>
-                      <Text style={styles.logoutText}>Profile</Text>
-                    </Pressable>
-                  </>
-                )}
-              </View>
-            ) : (
-              <>
-                <ScrollView ref={scrollRef} style={styles.messages} contentContainerStyle={styles.messagesContent}>
-                  {messages.map((m, idx) => (
-                    <MessageBubble key={`${m.role}-${idx}`} role={m.role} content={m.content} />
-                  ))}
-
-                  {loading && !streaming ? (
-                    <View style={[styles.bubbleRow, styles.aiRow]}>
-                      <AIBadge />
-                      <View style={[styles.bubble, styles.loaderBubble]}>
-                        <View style={styles.loaderPulse} />
-                      </View>
-                    </View>
-                  ) : null}
-
-                  {streaming ? (
-                    <View style={[styles.bubbleRow, styles.aiRow]}>
-                      <AIBadge />
-                      <View style={[styles.bubble, styles.aiBubble]}>
-                        <View style={styles.streamingRow}>
-                          <View style={styles.streamingMarkdown}>
-                            <Markdown style={markdownStyles}>{streamText || ' '}</Markdown>
-                          </View>
-                          <BlinkingCursor />
-                        </View>
-                      </View>
-                    </View>
-                  ) : null}
-                </ScrollView>
-
-                {error ? (
-                  <View style={[styles.errorBox, { marginHorizontal: 8, marginBottom: 4 }]}>
-                    <Text style={styles.errorTitle}>Chat connection failed</Text>
-                    <Text style={styles.errorBody}>{error}</Text>
-                  </View>
-                ) : null}
-
-                <Pressable onPress={() => setShowProfile(true)} style={{ paddingHorizontal: 12, paddingTop: 8 }}>
-                  <Text style={styles.logoutText}>Profile · {user.email}</Text>
-                </Pressable>
-
-                <View style={styles.inputRow}>
-                  <TextInput
-                    style={[
-                      styles.input,
-                      {
-                        height: Math.max(40, Math.min(108, inputHeight)),
-                        borderRadius: inputHeight > 54 ? 8 : 999,
-                      },
-                    ]}
-                    value={input}
-                    onChangeText={setInput}
-                    onContentSizeChange={(e) => setInputHeight(e.nativeEvent.contentSize.height + 8)}
-                    multiline
-                    placeholder="Ask the tour guide..."
-                    placeholderTextColor="#9ca3af"
-                    editable={!streaming && canSendPrompt({ user, llmKey })}
-                    autoFocus={false}
-                    onSubmitEditing={() => {
-                      if (!streaming && canSendPrompt({ user, llmKey })) sendPrompt();
-                    }}
-                    blurOnSubmit={false}
-                  />
-                  <Pressable
-                    style={[styles.sendButton, streaming || !canSendPrompt({ user, llmKey }) ? styles.sendButtonDisabled : null]}
-                    onPress={() => sendPrompt()}
-                    disabled={streaming || !canSendPrompt({ user, llmKey })}
-                  >
-                    <Text style={styles.sendButtonText}>Send</Text>
-                  </Pressable>
-                </View>
-              </>
-            )}
-          </View>
-        </KeyboardAvoidingView>
+        <MapPane
+          ref={mapPaneRef}
+          region={region}
+          markers={markers}
+          bottomPadding={isDesktopLayout ? 0 : Math.round(height * 0.45)}
+          onMap3DError={setMap3DError}
+        />
+        <ChatPanel isDesktopLayout={isDesktopLayout}>{panel}</ChatPanel>
       </View>
     </SafeAreaView>
   );
@@ -830,103 +282,10 @@ export default function App() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#020617' },
   container: { flex: 1 },
-  map: { ...StyleSheet.absoluteFillObject },
-  chatWrap: {
-    position: 'absolute',
-  },
-  chatPanel: {
-    flex: 1,
-    backgroundColor: 'rgba(31,41,55,0.90)',
-    borderRadius: 8,
-    overflow: 'hidden',
-  },
   centerState: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: 16,
   },
-  errorBox: {
-    backgroundColor: 'rgba(127,29,29,0.45)',
-    borderColor: '#7f1d1d',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    maxWidth: 360,
-  },
-  errorTitle: { color: '#fecaca', fontWeight: '700', marginBottom: 4 },
-  errorBody: { color: '#fee2e2' },
-  messages: { flex: 1 },
-  messagesContent: { paddingHorizontal: 8, paddingVertical: 10, gap: 8 },
-  bubbleRow: { flexDirection: 'row', marginVertical: 4, marginRight: 8 },
-  aiRow: { justifyContent: 'flex-start', alignItems: 'flex-start' },
-  userRow: { justifyContent: 'flex-end' },
-  aiBadgeOuter: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    marginRight: 8,
-    backgroundColor: '#111827',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  aiBadgeIcon: { fontSize: 16 },
-  bubble: {
-    maxWidth: '86%',
-    borderRadius: 14,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-  },
-  aiBubble: { backgroundColor: 'transparent' },
-  userBubble: {
-    backgroundColor: '#374151',
-    borderRadius: 999,
-    paddingHorizontal: 14,
-  },
-  loaderBubble: { backgroundColor: '#111827', borderRadius: 999, paddingVertical: 12, paddingHorizontal: 16 },
-  loaderPulse: {
-    width: 80,
-    height: 10,
-    borderRadius: 999,
-    backgroundColor: '#374151',
-  },
-  streamingRow: { flexDirection: 'row', alignItems: 'flex-end' },
-  streamingMarkdown: { flex: 1, minWidth: 0 },
-  cursor: { marginLeft: 4, color: '#fff' },
-  cursorHidden: { opacity: 0 },
-  inputRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    paddingHorizontal: 8,
-    paddingVertical: 8,
-    gap: 8,
-  },
-  input: {
-    flex: 1,
-    color: '#fff',
-    backgroundColor: '#374151',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    textAlignVertical: 'center',
-  },
-  sendButton: {
-    alignSelf: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-  },
-  sendButtonDisabled: { opacity: 0.5 },
-  sendButtonText: { color: '#fff', fontSize: 15 },
-  signedInHint: { color: '#cbd5e1', textAlign: 'center', marginTop: 12, paddingHorizontal: 16 },
-  logoutText: { color: '#93c5fd', textAlign: 'center', marginTop: 12 },
 });
-
-const markdownStyles = {
-  body: { color: '#e5e7eb', fontSize: 15, lineHeight: 21 },
-  paragraph: { marginTop: 0, marginBottom: 6 },
-  heading3: { color: '#f8fafc', marginBottom: 6, fontWeight: '700', fontSize: 18 },
-  list_item: { color: '#e5e7eb' },
-  code_inline: { backgroundColor: '#0f172a', color: '#c7d2fe', borderRadius: 4 },
-  code_block: { backgroundColor: '#0f172a', color: '#c7d2fe', borderRadius: 8, padding: 8 },
-  fence: { backgroundColor: '#0f172a', color: '#c7d2fe', borderRadius: 8, padding: 8 },
-  link: { color: '#93c5fd' },
-};

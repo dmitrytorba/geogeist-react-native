@@ -1,0 +1,16 @@
+const GOOGLE_MAPS_TILE_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY || '';
+const GOOGLE_MAPS_ANDROID_API_KEY =
+  process.env.EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_API_KEY ||
+  process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ||
+  process.env.EXPO_PUBLIC_GOOGLE_MAPS_TILE_API_KEY ||
+  '';
+const HAS_NATIVE_MAP_KEY = Boolean(GOOGLE_MAPS_ANDROID_API_KEY);
+
+const DEFAULT_REGION = {
+  latitude: 37.6191,
+  longitude: -122.3816,
+  latitudeDelta: 8,
+  longitudeDelta: 8,
+};
+
+module.exports = { DEFAULT_REGION, GOOGLE_MAPS_TILE_API_KEY, HAS_NATIVE_MAP_KEY };
