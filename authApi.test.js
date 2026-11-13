@@ -12,6 +12,18 @@ describe('auth error copy', () => {
   it('maps 401 to a readable bad-password message', () => {
     assert.equal(mapAuthError(401, { error: 'auth_required' }), 'Incorrect email or password.');
   });
+
+  it('maps 429 lockout to a readable wait message', () => {
+    assert.equal(
+      mapAuthError(429, { error: 'too_many_attempts', retry_after: 840 }),
+      'Too many sign-in attempts. Try again in 14 minutes.'
+    );
+    assert.equal(
+      mapAuthError(429, { error: 'too_many_attempts', retry_after: 30 }),
+      'Too many sign-in attempts. Try again in a minute.'
+    );
+    assert.equal(mapAuthError(429, null), 'Too many sign-in attempts. Try again in a minute.');
+  });
 });
 
 describe('authApi', () => {

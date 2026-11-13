@@ -1,7 +1,16 @@
 const { createJsonClient } = require('./httpClient');
 
+function waitText(seconds) {
+  const minutes = Math.ceil((Number(seconds) || 0) / 60);
+  if (minutes <= 1) return 'a minute';
+  return `${minutes} minutes`;
+}
+
 function mapAuthError(status, body) {
   const code = body && body.error;
+  if (status === 429 || code === 'too_many_attempts') {
+    return `Too many sign-in attempts. Try again in ${waitText(body && body.retry_after)}.`;
+  }
   if (status === 409 || code === 'email_taken') {
     return 'That email is already registered.';
   }

@@ -72,6 +72,7 @@ Native / Web  --session-->  FastAPI (tourapi.torb.uk)
 - Web: `gg_session` cookie, `HttpOnly`, `Secure`, `SameSite=Lax`.
 - `GET /me`, `POST /auth/signup`, `POST /auth/login`, `POST /auth/logout`.
 - Invalid/missing session on `/stream/`, `/tours*`, `/me` → **401** `{"error":"auth_required"}`.
+- Wrong-password limits on `/auth/login` (SKP-1876): 8 per client IP in 15 min, 8 per email in 15 min, 20 from everywhere in an hour. Client IP is `CF-Connecting-IP` only. A locked login → **429** `{"error":"too_many_attempts","retry_after":<s>}` with `Retry-After`, even with the right password. A good login clears that IP's and email's counts. Existing sessions keep working.
 - `/ipcoords/` stays anonymous (location fallback only).
 
 ### BYOK (ship gate)
